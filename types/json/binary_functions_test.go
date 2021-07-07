@@ -13,6 +13,8 @@
 package json
 
 import (
+	"testing"
+
 	. "github.com/pingcap/check"
 )
 
@@ -20,12 +22,18 @@ var _ = Suite(&testJSONFuncSuite{})
 
 type testJSONFuncSuite struct{}
 
-func (s *testJSONFuncSuite) TestdecodeEscapedUnicode(c *C) {
+func (s *testJSONFuncSuite) TestDecodeEscapedUnicode(c *C) {
 	c.Parallel()
 	in := "597d"
 	r, size, err := decodeEscapedUnicode([]byte(in))
 	c.Assert(string(r[:]), Equals, "好\x00")
 	c.Assert(size, Equals, 3)
 	c.Assert(err, IsNil)
+}
 
+func BenchmarkDecodeEscapedUnicode(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		in := "597d"
+		_, _, _ = decodeEscapedUnicode([]byte(in))
+	}
 }

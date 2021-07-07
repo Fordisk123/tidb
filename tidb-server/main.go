@@ -17,7 +17,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"runtime"
 	"strconv"
@@ -27,15 +27,17 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
-	"github.com/pingcap/pd/v4/client"
+	parsertypes "github.com/pingcap/parser/types"
 	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
 	"github.com/pingcap/tidb/bindinfo"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	plannercore "github.com/pingcap/tidb/planner/core"
@@ -46,25 +48,30 @@ import (
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/statistics"
-	"github.com/pingcap/tidb/statistics/handle"
 	kvstore "github.com/pingcap/tidb/store"
+	"github.com/pingcap/tidb/store/driver"
 	"github.com/pingcap/tidb/store/mockstore"
-	"github.com/pingcap/tidb/store/tikv"
-	"github.com/pingcap/tidb/store/tikv/gcworker"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/deadlockhistory"
+	"github.com/pingcap/tidb/util/disk"
 	"github.com/pingcap/tidb/util/domainutil"
+	"github.com/pingcap/tidb/util/kvcache"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/printer"
+	"github.com/pingcap/tidb/util/profile"
+	"github.com/pingcap/tidb/util/sem"
 	"github.com/pingcap/tidb/util/signal"
-	"github.com/pingcap/tidb/util/storeutil"
 	"github.com/pingcap/tidb/util/sys/linux"
+	storageSys "github.com/pingcap/tidb/util/sys/storage"
 	"github.com/pingcap/tidb/util/systimemon"
+	"github.com/pingcap/tidb/util/topsql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
+	"github.com/tikv/client-go/v2/tikv"
+	pd "github.com/tikv/pd/client"
 	"go.uber.org/automaxprocs/maxprocs"
 	"go.uber.org/zap"
-	"google.golang.org/grpc/grpclog"
 )
 
 // Flag Names
@@ -110,7 +117,7 @@ var (
 	configStrict = flagBoolean(nmConfigStrict, false, "enforce config file validity")
 
 	// Base
-	store            = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
+	store            = flag.String(nmStore, "unistore", "registered store name, [tikv, mocktikv, unistore]")
 	storePath        = flag.String(nmStorePath, "/tmp/tidb", "tidb storage path")
 	host             = flag.String(nmHost, "0.0.0.0", "tidb server host")
 	advertiseAddress = flag.String(nmAdvertiseAddress, "", "tidb server advertise IP")
@@ -145,34 +152,52 @@ var (
 	proxyProtocolHeaderTimeout = flag.Uint(nmProxyProtocolHeaderTimeout, 5, "proxy protocol header read timeout, unit is second.")
 )
 
-var (
-	storage  kv.Storage
-	dom      *domain.Domain
-	svr      *server.Server
-	graceful bool
-)
-
 func main() {
+	help := flag.Bool("help", false, "show the usage")
 	flag.Parse()
+	if *help {
+		flag.Usage()
+		os.Exit(0)
+	}
 	if *version {
 		fmt.Println(printer.GetTiDBInfo())
 		os.Exit(0)
 	}
 	registerStores()
 	registerMetrics()
-	config.InitializeConfig(*configPath, *configCheck, *configStrict, reloadConfig, overrideConfig)
+	config.InitializeConfig(*configPath, *configCheck, *configStrict, overrideConfig)
+	if config.GetGlobalConfig().OOMUseTmpStorage {
+		config.GetGlobalConfig().UpdateTempStoragePath()
+		err := disk.InitializeTempDir()
+		terror.MustNil(err)
+		checkTempStorageQuota()
+	}
+	// Enable failpoints in tikv/client-go if the test API is enabled.
+	// It appears in the main function to be set before any use of client-go to prevent data race.
+	if _, err := failpoint.Status("github.com/pingcap/tidb/server/enableTestAPI"); err == nil {
+		tikv.EnableFailpoints()
+	}
 	setGlobalVars()
 	setCPUAffinity()
 	setupLog()
+	setHeapProfileTracker()
 	setupTracing() // Should before createServer and after setup config.
 	printInfo()
 	setupBinlogClient()
 	setupMetrics()
-	createStoreAndDomain()
-	createServer()
-	signal.SetupSignalHandler(serverShutdown)
-	runServer()
-	cleanup()
+
+	storage, dom := createStoreAndDomain()
+	svr := createServer(storage, dom)
+
+	exited := make(chan struct{})
+	signal.SetupSignalHandler(func(graceful bool) {
+		svr.Close()
+		cleanup(svr, storage, dom, graceful)
+		close(exited)
+	})
+	topsql.SetupTopSQL()
+	terror.MustNil(svr.Run())
+	<-exited
 	syncLog()
 }
 
@@ -183,8 +208,29 @@ func exit() {
 
 func syncLog() {
 	if err := log.Sync(); err != nil {
+		// Don't complain about /dev/stdout as Fsync will return EINVAL.
+		if pathErr, ok := err.(*fs.PathError); ok {
+			if pathErr.Path == "/dev/stdout" {
+				os.Exit(0)
+			}
+		}
 		fmt.Fprintln(os.Stderr, "sync log err:", err)
 		os.Exit(1)
+	}
+}
+
+func checkTempStorageQuota() {
+	// check capacity and the quota when OOMUseTmpStorage is enabled
+	c := config.GetGlobalConfig()
+	if c.TempStorageQuota < 0 {
+		// means unlimited, do nothing
+	} else {
+		capacityByte, err := storageSys.GetTargetDirectoryCapacity(c.TempStoragePath)
+		if err != nil {
+			log.Fatal(err.Error())
+		} else if capacityByte < uint64(c.TempStorageQuota) {
+			log.Fatal(fmt.Sprintf("value of [tmp-storage-quota](%d byte) exceeds the capacity(%d byte) of the [%s] directory", c.TempStorageQuota, capacityByte, c.TempStoragePath))
+		}
 	}
 }
 
@@ -210,13 +256,21 @@ func setCPUAffinity() {
 		exit()
 	}
 	runtime.GOMAXPROCS(len(cpu))
+	metrics.MaxProcs.Set(float64(runtime.GOMAXPROCS(0)))
+}
+
+func setHeapProfileTracker() {
+	c := config.GetGlobalConfig()
+	d := parseDuration(c.Performance.MemProfileInterval)
+	go profile.HeapProfileForGlobalMemTracker(d)
 }
 
 func registerStores() {
-	err := kvstore.Register("tikv", tikv.Driver{})
+	err := kvstore.Register("tikv", driver.TiKVDriver{})
 	terror.MustNil(err)
-	tikv.NewGCHandlerFunc = gcworker.NewGCWorker
-	err = kvstore.Register("mocktikv", mockstore.MockDriver{})
+	err = kvstore.Register("mocktikv", mockstore.MockTiKVDriver{})
+	terror.MustNil(err)
+	err = kvstore.Register("unistore", mockstore.EmbedUnistoreDriver{})
 	terror.MustNil(err)
 }
 
@@ -224,15 +278,16 @@ func registerMetrics() {
 	metrics.RegisterMetrics()
 }
 
-func createStoreAndDomain() {
+func createStoreAndDomain() (kv.Storage, *domain.Domain) {
 	cfg := config.GetGlobalConfig()
 	fullPath := fmt.Sprintf("%s://%s", cfg.Store, cfg.Path)
 	var err error
-	storage, err = kvstore.New(fullPath)
+	storage, err := kvstore.New(fullPath)
 	terror.MustNil(err)
 	// Bootstrap a session to load information schema.
-	dom, err = session.BootstrapSession(storage)
+	dom, err := session.BootstrapSession(storage)
 	terror.MustNil(err)
+	return storage, dom
 }
 
 func setupBinlogClient() {
@@ -264,7 +319,7 @@ func setupBinlogClient() {
 
 	terror.MustNil(err)
 
-	err = pumpcli.InitLogger(cfg.Log.ToLogConfig())
+	err = logutil.InitLogger(cfg.Log.ToLogConfig())
 	terror.MustNil(err)
 
 	binloginfo.SetPumpsClient(client)
@@ -330,44 +385,6 @@ func flagBoolean(name string, defaultVal bool, usage string) *bool {
 	return flag.Bool(name, defaultVal, usage)
 }
 
-func reloadConfig(nc, c *config.Config) {
-	// Just a part of config items need to be reload explicitly.
-	// Some of them like OOMAction are always used by getting from global config directly
-	// like config.GetGlobalConfig().OOMAction.
-	// These config items will become available naturally after the global config pointer
-	// is updated in function ReloadGlobalConfig.
-	if nc.Performance.MaxMemory != c.Performance.MaxMemory {
-		plannercore.PreparedPlanCacheMaxMemory.Store(nc.Performance.MaxMemory)
-	}
-	if nc.Performance.CrossJoin != c.Performance.CrossJoin {
-		plannercore.AllowCartesianProduct.Store(nc.Performance.CrossJoin)
-	}
-	if nc.Performance.FeedbackProbability != c.Performance.FeedbackProbability {
-		statistics.FeedbackProbability.Store(nc.Performance.FeedbackProbability)
-	}
-	if nc.Performance.QueryFeedbackLimit != c.Performance.QueryFeedbackLimit {
-		handle.MaxQueryFeedbackCount.Store(int64(nc.Performance.QueryFeedbackLimit))
-	}
-	if nc.Performance.PseudoEstimateRatio != c.Performance.PseudoEstimateRatio {
-		statistics.RatioOfPseudoEstimate.Store(nc.Performance.PseudoEstimateRatio)
-	}
-	if nc.Performance.MaxProcs != c.Performance.MaxProcs {
-		runtime.GOMAXPROCS(int(nc.Performance.MaxProcs))
-	}
-	if nc.TiKVClient.StoreLimit != c.TiKVClient.StoreLimit {
-		storeutil.StoreLimit.Store(nc.TiKVClient.StoreLimit)
-	}
-
-	if nc.PreparedPlanCache.Enabled != c.PreparedPlanCache.Enabled {
-		plannercore.SetPreparedPlanCache(nc.PreparedPlanCache.Enabled)
-	}
-	if nc.Log.Level != c.Log.Level {
-		if err := logutil.SetLevel(nc.Log.Level); err != nil {
-			logutil.BgLogger().Error("update log level error", zap.Error(err))
-		}
-	}
-}
-
 // overrideConfig considers command arguments and overrides some config items in the Config.
 func overrideConfig(cfg *config.Config) {
 	actualFlags := make(map[string]bool)
@@ -380,7 +397,15 @@ func overrideConfig(cfg *config.Config) {
 		cfg.Host = *host
 	}
 	if actualFlags[nmAdvertiseAddress] {
+		var err error
+		if len(strings.Split(*advertiseAddress, " ")) > 1 {
+			err = errors.Errorf("Only support one advertise-address")
+		}
+		terror.MustNil(err)
 		cfg.AdvertiseAddress = *advertiseAddress
+	}
+	if len(cfg.AdvertiseAddress) == 0 && cfg.Host == "0.0.0.0" {
+		cfg.AdvertiseAddress = util.GetLocalIP()
 	}
 	if len(cfg.AdvertiseAddress) == 0 {
 		cfg.AdvertiseAddress = cfg.Host
@@ -477,15 +502,28 @@ func overrideConfig(cfg *config.Config) {
 
 func setGlobalVars() {
 	cfg := config.GetGlobalConfig()
+
+	// Disable automaxprocs log
+	nopLog := func(string, ...interface{}) {}
+	_, err := maxprocs.Set(maxprocs.Logger(nopLog))
+	terror.MustNil(err)
+	// We should respect to user's settings in config file.
+	// The default value of MaxProcs is 0, runtime.GOMAXPROCS(0) is no-op.
+	runtime.GOMAXPROCS(int(cfg.Performance.MaxProcs))
+	metrics.MaxProcs.Set(float64(runtime.GOMAXPROCS(0)))
+
+	util.SetGOGC(cfg.Performance.GOGC)
+
 	ddlLeaseDuration := parseDuration(cfg.Lease)
 	session.SetSchemaLease(ddlLeaseDuration)
-	runtime.GOMAXPROCS(int(cfg.Performance.MaxProcs))
 	statsLeaseDuration := parseDuration(cfg.Performance.StatsLease)
 	session.SetStatsLease(statsLeaseDuration)
+	indexUsageSyncLeaseDuration := parseDuration(cfg.Performance.IndexUsageSyncLease)
+	session.SetIndexUsageSyncLease(indexUsageSyncLeaseDuration)
 	bindinfo.Lease = parseDuration(cfg.Performance.BindInfoLease)
 	domain.RunAutoAnalyze = cfg.Performance.RunAutoAnalyze
 	statistics.FeedbackProbability.Store(cfg.Performance.FeedbackProbability)
-	handle.MaxQueryFeedbackCount.Store(int64(cfg.Performance.QueryFeedbackLimit))
+	statistics.MaxQueryFeedbackCount.Store(int64(cfg.Performance.QueryFeedbackLimit))
 	statistics.RatioOfPseudoEstimate.Store(cfg.Performance.PseudoEstimateRatio)
 	ddl.RunWorker = cfg.RunDDL
 	if cfg.SplitTable {
@@ -494,19 +532,33 @@ func setGlobalVars() {
 	plannercore.AllowCartesianProduct.Store(cfg.Performance.CrossJoin)
 	privileges.SkipWithGrant = cfg.Security.SkipGrantTable
 	kv.TxnTotalSizeLimit = cfg.Performance.TxnTotalSizeLimit
+	if cfg.Performance.TxnEntrySizeLimit > 120*1024*1024 {
+		log.Fatal("cannot set txn entry size limit larger than 120M")
+	}
+	kv.TxnEntrySizeLimit = cfg.Performance.TxnEntrySizeLimit
 
 	priority := mysql.Str2Priority(cfg.Performance.ForcePriority)
 	variable.ForcePriority = int32(priority)
-	variable.SysVars[variable.TiDBForcePriority].Value = mysql.Priority2Str[priority]
 
-	variable.SysVars[variable.TIDBMemQuotaQuery].Value = strconv.FormatInt(cfg.MemQuotaQuery, 10)
-	variable.SysVars["lower_case_table_names"].Value = strconv.Itoa(cfg.LowerCaseTableNames)
-	variable.SysVars[variable.LogBin].Value = variable.BoolToIntStr(config.GetGlobalConfig().Binlog.Enable)
+	variable.SetSysVar(variable.TiDBForcePriority, mysql.Priority2Str[priority])
+	variable.SetSysVar(variable.TiDBOptDistinctAggPushDown, variable.BoolToOnOff(cfg.Performance.DistinctAggPushDown))
+	variable.SetSysVar(variable.TiDBMemQuotaQuery, strconv.FormatInt(cfg.MemQuotaQuery, 10))
+	variable.SetSysVar(variable.LowerCaseTableNames, strconv.Itoa(cfg.LowerCaseTableNames))
+	variable.SetSysVar(variable.LogBin, variable.BoolToOnOff(cfg.Binlog.Enable))
+	variable.SetSysVar(variable.Port, fmt.Sprintf("%d", cfg.Port))
+	variable.SetSysVar(variable.Socket, cfg.Socket)
+	variable.SetSysVar(variable.DataDir, cfg.Path)
+	variable.SetSysVar(variable.TiDBSlowQueryFile, cfg.Log.SlowQueryFile)
+	variable.SetSysVar(variable.TiDBIsolationReadEngines, strings.Join(cfg.IsolationRead.Engines, ","))
+	variable.SetSysVar(variable.TiDBEnforceMPPExecution, variable.BoolToOnOff(config.GetGlobalConfig().Performance.EnforceMPP))
+	variable.MemoryUsageAlarmRatio.Store(cfg.Performance.MemoryUsageAlarmRatio)
+	if hostname, err := os.Hostname(); err != nil {
+		variable.SetSysVar(variable.Hostname, hostname)
+	}
 
-	variable.SysVars[variable.Port].Value = fmt.Sprintf("%d", cfg.Port)
-	variable.SysVars[variable.Socket].Value = cfg.Socket
-	variable.SysVars[variable.DataDir].Value = cfg.Path
-	variable.SysVars[variable.TiDBSlowQueryFile].Value = cfg.Log.SlowQueryFile
+	if cfg.Security.EnableSEM {
+		sem.Enable()
+	}
 
 	// For CI environment we default enable prepare-plan-cache.
 	plannercore.SetPreparedPlanCache(config.CheckTableBeforeDrop || cfg.PreparedPlanCache.Enabled)
@@ -516,7 +568,7 @@ func setGlobalVars() {
 		if plannercore.PreparedPlanCacheMemoryGuardRatio < 0.0 || plannercore.PreparedPlanCacheMemoryGuardRatio > 1.0 {
 			plannercore.PreparedPlanCacheMemoryGuardRatio = 0.1
 		}
-		plannercore.PreparedPlanCacheMaxMemory.Store(cfg.Performance.MaxMemory)
+		plannercore.PreparedPlanCacheMaxMemory.Store(cfg.Performance.ServerMemoryQuota)
 		total, err := memory.MemTotal()
 		terror.MustNil(err)
 		if plannercore.PreparedPlanCacheMaxMemory.Load() > total || plannercore.PreparedPlanCacheMaxMemory.Load() <= 0 {
@@ -524,29 +576,34 @@ func setGlobalVars() {
 		}
 	}
 
-	tikv.CommitMaxBackoff = int(parseDuration(cfg.TiKVClient.CommitTimeout).Seconds() * 1000)
-	tikv.RegionCacheTTLSec = int64(cfg.TiKVClient.RegionCacheTTL)
+	atomic.StoreUint64(&tikv.CommitMaxBackoff, uint64(parseDuration(cfg.TiKVClient.CommitTimeout).Seconds()*1000))
+	tikv.SetRegionCacheTTLSec(int64(cfg.TiKVClient.RegionCacheTTL))
 	domainutil.RepairInfo.SetRepairMode(cfg.RepairMode)
 	domainutil.RepairInfo.SetRepairTableList(cfg.RepairTableList)
+	executor.GlobalDiskUsageTracker.SetBytesLimit(cfg.TempStorageQuota)
+	if cfg.Performance.ServerMemoryQuota < 1 {
+		// If MaxMemory equals 0, it means unlimited
+		executor.GlobalMemoryUsageTracker.SetBytesLimit(-1)
+	} else {
+		executor.GlobalMemoryUsageTracker.SetBytesLimit(int64(cfg.Performance.ServerMemoryQuota))
+	}
+	kvcache.GlobalLRUMemUsageTracker.AttachToGlobalTracker(executor.GlobalMemoryUsageTracker)
+
+	t, err := time.ParseDuration(cfg.TiKVClient.StoreLivenessTimeout)
+	if err != nil || t < 0 {
+		logutil.BgLogger().Fatal("invalid duration value for store-liveness-timeout",
+			zap.String("currentValue", cfg.TiKVClient.StoreLivenessTimeout))
+	}
+	tikv.SetStoreLivenessTimeout(t)
+	parsertypes.TiDBStrictIntegerDisplayWidth = cfg.DeprecateIntegerDisplayWidth
+	deadlockhistory.GlobalDeadlockHistory.Resize(cfg.PessimisticTxn.DeadlockHistoryCapacity)
 }
 
 func setupLog() {
 	cfg := config.GetGlobalConfig()
-	err := logutil.InitZapLogger(cfg.Log.ToLogConfig())
+	err := logutil.InitLogger(cfg.Log.ToLogConfig())
 	terror.MustNil(err)
 
-	err = logutil.InitLogger(cfg.Log.ToLogConfig())
-	terror.MustNil(err)
-	// Disable automaxprocs log
-	nopLog := func(string, ...interface{}) {}
-	_, err = maxprocs.Set(maxprocs.Logger(nopLog))
-	terror.MustNil(err)
-
-	if len(os.Getenv("GRPC_DEBUG")) > 0 {
-		grpclog.SetLoggerV2(grpclog.NewLoggerV2WithVerbosity(os.Stderr, os.Stderr, os.Stderr, 999))
-	} else {
-		grpclog.SetLoggerV2(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, os.Stderr))
-	}
 	// trigger internal http(s) client init.
 	util.InternalHTTPClient()
 }
@@ -559,23 +616,20 @@ func printInfo() {
 	log.SetLevel(level)
 }
 
-func createServer() {
+func createServer(storage kv.Storage, dom *domain.Domain) *server.Server {
 	cfg := config.GetGlobalConfig()
 	driver := server.NewTiDBDriver(storage)
-	var err error
-	svr, err = server.NewServer(cfg, driver)
+	svr, err := server.NewServer(cfg, driver)
 	// Both domain and storage have started, so we have to clean them before exiting.
-	terror.MustNil(err, closeDomainAndStorage)
+	if err != nil {
+		closeDomainAndStorage(storage, dom)
+		log.Fatal("failed to create the server", zap.Error(err), zap.Stack("stack"))
+	}
 	svr.SetDomain(dom)
+	svr.InitGlobalConnID(dom.ServerID)
 	go dom.ExpensiveQueryHandle().SetSessionManager(svr).Run()
 	dom.InfoSyncer().SetSessionManager(svr)
-}
-
-func serverShutdown(isgraceful bool) {
-	if isgraceful {
-		graceful = true
-	}
-	svr.Close()
+	return svr
 }
 
 func setupMetrics() {
@@ -586,7 +640,7 @@ func setupMetrics() {
 		metrics.TimeJumpBackCounter.Inc()
 	}
 	callBackCount := 0
-	sucessCallBack := func() {
+	successCallBack := func() {
 		callBackCount++
 		// It is callback by monitor per second, we increase metrics.KeepAliveCounter per 5s.
 		if callBackCount >= 5 {
@@ -594,7 +648,7 @@ func setupMetrics() {
 			metrics.KeepAliveCounter.Inc()
 		}
 	}
-	go systimemon.StartMonitor(time.Now, systimeErrHandler, sucessCallBack)
+	go systimemon.StartMonitor(time.Now, systimeErrHandler, successCallBack)
 
 	pushMetric(cfg.Status.MetricsAddr, time.Duration(cfg.Status.MetricsInterval)*time.Second)
 }
@@ -610,26 +664,23 @@ func setupTracing() {
 	opentracing.SetGlobalTracer(tracer)
 }
 
-func runServer() {
-	err := svr.Run()
-	terror.MustNil(err)
-}
-
-func closeDomainAndStorage() {
-	atomic.StoreUint32(&tikv.ShuttingDown, 1)
+func closeDomainAndStorage(storage kv.Storage, dom *domain.Domain) {
+	tikv.StoreShuttingDown(1)
 	dom.Close()
 	err := storage.Close()
 	terror.Log(errors.Trace(err))
 }
 
-func cleanup() {
+func cleanup(svr *server.Server, storage kv.Storage, dom *domain.Domain, graceful bool) {
 	if graceful {
 		svr.GracefulDown(context.Background(), nil)
 	} else {
 		svr.TryGracefulDown()
 	}
 	plugin.Shutdown(context.Background())
-	closeDomainAndStorage()
+	closeDomainAndStorage(storage, dom)
+	disk.CleanUp()
+	topsql.Close()
 }
 
 func stringToList(repairString string) []string {

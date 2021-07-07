@@ -27,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/vitess"
 )
 
 func (b *builtinInetNtoaSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
@@ -52,7 +53,7 @@ func (b *builtinInetNtoaSig) vecEvalString(input *chunk.Chunk, result *chunk.Col
 		binary.BigEndian.PutUint32(ip, uint32(val))
 		ipv4 := ip.To4()
 		if ipv4 == nil {
-			//Not a vaild ipv4 address.
+			// Not a vaild ipv4 address.
 			result.AppendNull()
 			continue
 		}
@@ -256,7 +257,7 @@ func (b *builtinIsIPv4CompatSig) vecEvalInt(input *chunk.Chunk, result *chunk.Co
 			// See example https://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_is-ipv4-compat
 			ipAddress := buf.GetBytes(i)
 			if len(ipAddress) != net.IPv6len || !bytes.HasPrefix(ipAddress, prefixCompat) {
-				//Not an IPv6 address, return false
+				// Not an IPv6 address, return false
 				i64s[i] = 0
 			} else {
 				i64s[i] = 1
@@ -334,20 +335,22 @@ func (b *builtinSleepSig) vecEvalInt(input *chunk.Chunk, result *chunk.Column) e
 }
 
 func doSleep(secs float64, sessVars *variable.SessionVars) (isKilled bool) {
+	if secs <= 0.0 {
+		return false
+	}
 	dur := time.Duration(secs * float64(time.Second.Nanoseconds()))
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	start := time.Now()
+	timer := time.NewTimer(dur)
 	for {
 		select {
-		case now := <-ticker.C:
+		case <-ticker.C:
 			if atomic.CompareAndSwapUint32(&sessVars.Killed, 1, 0) {
+				timer.Stop()
 				return true
 			}
-
-			if now.Sub(start) > dur {
-				return false
-			}
+		case <-timer.C:
+			return false
 		}
 	}
 }
@@ -379,7 +382,7 @@ func (b *builtinIsIPv4MappedSig) vecEvalInt(input *chunk.Chunk, result *chunk.Co
 			// See example https://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_is-ipv4-mapped
 			ipAddress := buf.GetBytes(i)
 			if len(ipAddress) != net.IPv6len || !bytes.HasPrefix(ipAddress, prefixMapped) {
-				//Not an IPv6 address, return false
+				// Not an IPv6 address, return false
 				i64s[i] = 0
 			} else {
 				i64s[i] = 1
@@ -446,7 +449,7 @@ func (b *builtinInet6AtonSig) vecEvalString(input *chunk.Chunk, result *chunk.Co
 		var isMappedIpv6 bool
 		ipTo4 := ip.To4()
 		if ipTo4 != nil && strings.Contains(val, ":") {
-			//mapped ipv6 address.
+			// mapped ipv6 address.
 			isMappedIpv6 = true
 		}
 
@@ -515,7 +518,7 @@ func (b *builtinInetAtonSig) vecEvalInt(input *chunk.Chunk, result *chunk.Column
 			result.SetNull(i, true)
 			continue
 		}
-		//reset
+		// reset
 		byteResult = 0
 		res = 0
 		dotCount = 0
@@ -578,7 +581,7 @@ func (b *builtinInet6NtoaSig) vecEvalString(input *chunk.Chunk, result *chunk.Co
 			continue
 		}
 		valI := val.GetString(i)
-		ip := net.IP([]byte(valI)).String()
+		ip := net.IP(valI).String()
 		if len(valI) == net.IPv6len && !strings.Contains(ip, ":") {
 			ip = fmt.Sprintf("::ffff:%s", ip)
 		}
@@ -612,6 +615,155 @@ func (b *builtinReleaseLockSig) vecEvalInt(input *chunk.Chunk, result *chunk.Col
 	i64s := result.Int64s()
 	for i := range i64s {
 		i64s[i] = 1
+	}
+	return nil
+}
+
+func (b *builtinVitessHashSig) vectorized() bool {
+	return true
+}
+
+func (b *builtinVitessHashSig) vecEvalInt(input *chunk.Chunk, result *chunk.Column) error {
+	n := input.NumRows()
+	column, err := b.bufAllocator.get(types.ETInt, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(column)
+
+	if err := b.args[0].VecEvalInt(b.ctx, input, column); err != nil {
+		return err
+	}
+
+	result.ResizeInt64(n, false)
+	r64s := result.Uint64s()
+	result.MergeNulls(column)
+
+	for i := 0; i < n; i++ {
+		if column.IsNull(i) {
+			continue
+		}
+		var uintKey = column.GetUint64(i)
+		var hash uint64
+		if hash, err = vitess.HashUint64(uintKey); err != nil {
+			return err
+		}
+		r64s[i] = hash
+	}
+
+	return nil
+}
+
+func (b *builtinUUIDToBinSig) vectorized() bool {
+	return true
+}
+
+// evalString evals UUID_TO_BIN(string_uuid, swap_flag).
+// See https://dev.mysql.com/doc/refman/8.0/en/miscellaneous-functions.html#function_uuid-to-bin
+func (b *builtinUUIDToBinSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
+	n := input.NumRows()
+	valBuf, err := b.bufAllocator.get(types.ETString, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(valBuf)
+	if err := b.args[0].VecEvalString(b.ctx, input, valBuf); err != nil {
+		return err
+	}
+
+	var flagBuf *chunk.Column
+	i64s := make([]int64, n)
+	if len(b.args) == 2 {
+		flagBuf, err = b.bufAllocator.get(types.ETInt, n)
+		if err != nil {
+			return err
+		}
+		defer b.bufAllocator.put(flagBuf)
+		if err := b.args[1].VecEvalInt(b.ctx, input, flagBuf); err != nil {
+			return err
+		}
+		i64s = flagBuf.Int64s()
+	}
+	result.ReserveString(n)
+	for i := 0; i < n; i++ {
+		if valBuf.IsNull(i) {
+			result.AppendNull()
+			continue
+		}
+		val := valBuf.GetString(i)
+		u, err := uuid.Parse(val)
+		if err != nil {
+			return errWrongValueForType.GenWithStackByArgs("string", val, "uuid_to_bin")
+		}
+		bin, err := u.MarshalBinary()
+		if err != nil {
+			return errWrongValueForType.GenWithStackByArgs("string", val, "uuid_to_bin")
+		}
+		if len(b.args) == 2 && flagBuf.IsNull(i) {
+			result.AppendString(string(bin))
+			continue
+		}
+		if i64s[i] != 0 {
+			result.AppendString(swapBinaryUUID(bin))
+		} else {
+			result.AppendString(string(bin))
+		}
+	}
+	return nil
+}
+
+func (b *builtinBinToUUIDSig) vectorized() bool {
+	return true
+}
+
+// evalString evals BIN_TO_UUID(binary_uuid, swap_flag).
+// See https://dev.mysql.com/doc/refman/8.0/en/miscellaneous-functions.html#function_bin-to-uuid
+func (b *builtinBinToUUIDSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
+	n := input.NumRows()
+	valBuf, err := b.bufAllocator.get(types.ETString, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(valBuf)
+	if err := b.args[0].VecEvalString(b.ctx, input, valBuf); err != nil {
+		return err
+	}
+
+	var flagBuf *chunk.Column
+	i64s := make([]int64, n)
+	if len(b.args) == 2 {
+		flagBuf, err = b.bufAllocator.get(types.ETInt, n)
+		if err != nil {
+			return err
+		}
+		defer b.bufAllocator.put(flagBuf)
+		if err := b.args[1].VecEvalInt(b.ctx, input, flagBuf); err != nil {
+			return err
+		}
+		i64s = flagBuf.Int64s()
+	}
+	result.ReserveString(n)
+	for i := 0; i < n; i++ {
+		if valBuf.IsNull(i) {
+			result.AppendNull()
+			continue
+		}
+		val := valBuf.GetString(i)
+		var u uuid.UUID
+		err = u.UnmarshalBinary([]byte(val))
+		if err != nil {
+			return errWrongValueForType.GenWithStackByArgs("string", val, "bin_to_uuid")
+		}
+		str := u.String()
+		if len(b.args) == 2 && flagBuf.IsNull(i) {
+			result.AppendString(str)
+			continue
+		}
+		if i64s[i] != 0 {
+			result.AppendString(swapStringUUID(str))
+		} else {
+			result.AppendString(str)
+		}
 	}
 	return nil
 }

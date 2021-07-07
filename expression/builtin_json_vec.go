@@ -14,6 +14,8 @@
 package expression
 
 import (
+	"bytes"
+	goJSON "encoding/json"
 	"strconv"
 	"strings"
 
@@ -357,11 +359,108 @@ func (b *builtinJSONQuoteSig) vecEvalString(input *chunk.Chunk, result *chunk.Co
 }
 
 func (b *builtinJSONSearchSig) vectorized() bool {
-	return false
+	return true
 }
 
 func (b *builtinJSONSearchSig) vecEvalJSON(input *chunk.Chunk, result *chunk.Column) error {
-	return errors.Errorf("not implemented")
+	nr := input.NumRows()
+	jsonBuf, err := b.bufAllocator.get(types.ETJson, nr)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(jsonBuf)
+	if err := b.args[0].VecEvalJSON(b.ctx, input, jsonBuf); err != nil {
+		return err
+	}
+	typeBuf, err := b.bufAllocator.get(types.ETString, nr)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(typeBuf)
+	if err := b.args[1].VecEvalString(b.ctx, input, typeBuf); err != nil {
+		return err
+	}
+	searchBuf, err := b.bufAllocator.get(types.ETString, nr)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(searchBuf)
+	if err := b.args[2].VecEvalString(b.ctx, input, searchBuf); err != nil {
+		return err
+	}
+
+	var escapeBuf *chunk.Column
+	if len(b.args) >= 4 {
+		escapeBuf, err = b.bufAllocator.get(types.ETString, nr)
+		if err != nil {
+			return err
+		}
+		defer b.bufAllocator.put(escapeBuf)
+		if err := b.args[3].VecEvalString(b.ctx, input, escapeBuf); err != nil {
+			return err
+		}
+	}
+
+	var pathBufs []*chunk.Column
+	if len(b.args) >= 5 {
+		pathBufs = make([]*chunk.Column, (len(b.args) - 4))
+		for i := 4; i < len(b.args); i++ {
+			index := i - 4
+			pathBufs[index], err = b.bufAllocator.get(types.ETString, nr)
+			if err != nil {
+				return err
+			}
+			defer b.bufAllocator.put(pathBufs[index])
+			if err := b.args[i].VecEvalString(b.ctx, input, pathBufs[index]); err != nil {
+				return err
+			}
+		}
+	}
+
+	result.ReserveJSON(nr)
+
+	for i := 0; i < nr; i++ {
+		if jsonBuf.IsNull(i) || searchBuf.IsNull(i) || typeBuf.IsNull(i) {
+			result.AppendNull()
+			continue
+		}
+		containType := strings.ToLower(typeBuf.GetString(i))
+		escape := byte('\\')
+		if escapeBuf != nil && !escapeBuf.IsNull(i) {
+			escapeStr := escapeBuf.GetString(i)
+			if len(escapeStr) == 0 {
+				escape = byte('\\')
+			} else if len(escapeStr) == 1 {
+				escape = escapeStr[0]
+			} else {
+				return errIncorrectArgs.GenWithStackByArgs("ESCAPE")
+			}
+		}
+		var pathExprs []json.PathExpression
+		if pathBufs != nil {
+			pathExprs = make([]json.PathExpression, 0, len(b.args)-4)
+			for j := 0; j < len(b.args)-4; j++ {
+				if pathBufs[j].IsNull(i) {
+					break
+				}
+				pathExpr, err := json.ParseJSONPathExpr(pathBufs[j].GetString(i))
+				if err != nil {
+					return json.ErrInvalidJSONPath.GenWithStackByArgs(pathBufs[j].GetString(i))
+				}
+				pathExprs = append(pathExprs, pathExpr)
+			}
+		}
+		bj, isNull, err := jsonBuf.GetJSON(i).Search(containType, searchBuf.GetString(i), escape, pathExprs)
+		if err != nil {
+			return err
+		}
+		if isNull {
+			result.AppendNull()
+			continue
+		}
+		result.AppendJSON(bj)
+	}
+	return nil
 }
 
 func (b *builtinJSONSetSig) vectorized() bool {
@@ -967,11 +1066,87 @@ func (b *builtinJSONContainsPathSig) vecEvalInt(input *chunk.Chunk, result *chun
 }
 
 func (b *builtinJSONArrayAppendSig) vectorized() bool {
-	return false
+	return true
 }
 
 func (b *builtinJSONArrayAppendSig) vecEvalJSON(input *chunk.Chunk, result *chunk.Column) error {
-	return errors.Errorf("not implemented")
+	n := input.NumRows()
+	m := (len(b.args) - 1) / 2
+
+	jsonBufs, err := b.bufAllocator.get(types.ETJson, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(jsonBufs)
+	if err := b.args[0].VecEvalJSON(b.ctx, input, jsonBufs); err != nil {
+		return err
+	}
+
+	pathBufs := make([]*chunk.Column, 0, m)
+	valBufs := make([]*chunk.Column, 0, m)
+	defer func() {
+		for _, buf := range pathBufs {
+			b.bufAllocator.put(buf)
+		}
+		for _, buf := range valBufs {
+			b.bufAllocator.put(buf)
+		}
+	}()
+	for i := 1; i < len(b.args)-1; i += 2 {
+		pathBuf, err := b.bufAllocator.get(types.ETString, n)
+		if err != nil {
+			return err
+		}
+		pathBufs = append(pathBufs, pathBuf)
+		if err := b.args[i].VecEvalString(b.ctx, input, pathBuf); err != nil {
+			return err
+		}
+		valBuf, err := b.bufAllocator.get(types.ETJson, n)
+		if err != nil {
+			return err
+		}
+		if err := b.args[i+1].VecEvalJSON(b.ctx, input, valBuf); err != nil {
+			return err
+		}
+		valBufs = append(valBufs, valBuf)
+	}
+
+	result.ReserveJSON(n)
+	for i := 0; i < n; i++ {
+		if jsonBufs.IsNull(i) {
+			result.AppendNull()
+			continue
+		}
+		res := jsonBufs.GetJSON(i)
+		isNull := false
+		for j := 0; j < m; j++ {
+			if pathBufs[j].IsNull(i) {
+				isNull = true
+				break
+			}
+			s := pathBufs[j].GetString(i)
+			v, vNull := json.BinaryJSON{}, valBufs[j].IsNull(i)
+			if !vNull {
+				v = valBufs[j].GetJSON(i)
+			}
+			if vNull {
+				v = json.CreateBinary(nil)
+			}
+			res, isNull, err = b.appendJSONArray(res, s, v)
+			if err != nil {
+				return err
+			}
+			if isNull {
+				break
+			}
+		}
+		if isNull {
+			result.AppendNull()
+		} else {
+			result.AppendJSON(res)
+		}
+	}
+	return nil
 }
 
 func (b *builtinJSONUnquoteSig) vectorized() bool {
@@ -995,11 +1170,51 @@ func (b *builtinJSONUnquoteSig) vecEvalString(input *chunk.Chunk, result *chunk.
 			result.AppendNull()
 			continue
 		}
-		str, err := json.UnquoteString(buf.GetString(i))
+		str := buf.GetString(i)
+		if len(str) >= 2 && str[0] == '"' && str[len(str)-1] == '"' && !goJSON.Valid([]byte(str)) {
+			return json.ErrInvalidJSONText.GenWithStackByArgs("The document root must not be followed by other values.")
+		}
+		str, err := json.UnquoteString(str)
 		if err != nil {
 			return err
 		}
 		result.AppendString(str)
+	}
+	return nil
+}
+
+func (b *builtinJSONSPrettySig) vectorized() bool {
+	return true
+}
+
+func (b *builtinJSONSPrettySig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
+	n := input.NumRows()
+	buf, err := b.bufAllocator.get(types.ETJson, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(buf)
+	if err := b.args[0].VecEvalJSON(b.ctx, input, buf); err != nil {
+		return err
+	}
+	result.ReserveString(n)
+	for i := 0; i < n; i++ {
+		if buf.IsNull(i) {
+			result.AppendNull()
+			continue
+		}
+
+		jb, err := buf.GetJSON(i).MarshalJSON()
+		if err != nil {
+			return err
+		}
+
+		var resBuf bytes.Buffer
+		if err = goJSON.Indent(&resBuf, jb, "", "  "); err != nil {
+			return err
+		}
+
+		result.AppendString(resBuf.String())
 	}
 	return nil
 }

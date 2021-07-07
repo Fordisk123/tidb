@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/types"
 	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
 	"golang.org/x/tools/container/intsets"
@@ -215,6 +216,7 @@ func ColumnSubstituteImpl(expr Expression, schema *Schema, newExprs []Expression
 		if v.InOperand {
 			newExpr = setExprColumnInOperand(newExpr)
 		}
+		newExpr.SetCoercibility(v.Coercibility())
 		return true, newExpr
 	case *ScalarFunction:
 		if v.FuncName.L == ast.Cast {
@@ -226,8 +228,21 @@ func ColumnSubstituteImpl(expr Expression, schema *Schema, newExprs []Expression
 		// when expr in args is changed
 		refExprArr := cowExprRef{v.GetArgs(), nil}
 		substituted := false
+		_, coll := DeriveCollationFromExprs(v.GetCtx(), v.GetArgs()...)
 		for idx, arg := range v.GetArgs() {
 			changed, newFuncExpr := ColumnSubstituteImpl(arg, schema, newExprs)
+			if collate.NewCollationEnabled() {
+				// Make sure the collation used by the ScalarFunction isn't changed and its result collation is not weaker than the collation used by the ScalarFunction.
+				if changed {
+					changed = false
+					tmpArgs := make([]Expression, 0, len(v.GetArgs()))
+					_ = append(append(append(tmpArgs, refExprArr.Result()[0:idx]...), refExprArr.Result()[idx+1:]...), newFuncExpr)
+					_, newColl := DeriveCollationFromExprs(v.GetCtx(), append(v.GetArgs(), newFuncExpr)...)
+					if coll == newColl {
+						changed = checkCollationStrictness(coll, newFuncExpr.GetType().Collate)
+					}
+				}
+			}
 			refExprArr.Set(idx, changed, newFuncExpr)
 			if changed {
 				substituted = true
@@ -238,6 +253,27 @@ func ColumnSubstituteImpl(expr Expression, schema *Schema, newExprs []Expression
 		}
 	}
 	return false, expr
+}
+
+// checkCollationStrictness check collation strictness-ship between `coll` and `newFuncColl`
+// return true iff `newFuncColl` is not weaker than `coll`
+func checkCollationStrictness(coll, newFuncColl string) bool {
+	collGroupID, ok1 := CollationStrictnessGroup[coll]
+	newFuncCollGroupID, ok2 := CollationStrictnessGroup[newFuncColl]
+
+	if ok1 && ok2 {
+		if collGroupID == newFuncCollGroupID {
+			return true
+		}
+
+		for _, id := range CollationStrictness[collGroupID] {
+			if newFuncCollGroupID == id {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // getValidPrefix gets a prefix of string which can parsed to a number with base. the minimum base is 2 and the maximum is 36.
@@ -336,6 +372,24 @@ func timeZone2Duration(tz string) time.Duration {
 	return time.Duration(sign) * (time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
 }
 
+var logicalOps = map[string]struct{}{
+	ast.LT:                 {},
+	ast.GE:                 {},
+	ast.GT:                 {},
+	ast.LE:                 {},
+	ast.EQ:                 {},
+	ast.NE:                 {},
+	ast.UnaryNot:           {},
+	ast.LogicAnd:           {},
+	ast.LogicOr:            {},
+	ast.LogicXor:           {},
+	ast.In:                 {},
+	ast.IsNull:             {},
+	ast.IsTruthWithoutNull: {},
+	ast.IsFalsity:          {},
+	ast.Like:               {},
+}
+
 var oppositeOp = map[string]string{
 	ast.LT:       ast.GE,
 	ast.GE:       ast.LT,
@@ -369,12 +423,24 @@ func pushNotAcrossArgs(ctx sessionctx.Context, exprs []Expression, not bool) ([]
 	return newExprs, flag
 }
 
-// pushNotAcrossExpr try to eliminate the NOT expr in expression tree. It will records whether there's already NOT pushed.
-func pushNotAcrossExpr(ctx sessionctx.Context, expr Expression, not bool) (Expression, bool) {
+// pushNotAcrossExpr try to eliminate the NOT expr in expression tree.
+// Input `not` indicates whether there's a `NOT` be pushed down.
+// Output `changed` indicates whether the output expression differs from the
+// input `expr` because of the pushed-down-not.
+func pushNotAcrossExpr(ctx sessionctx.Context, expr Expression, not bool) (_ Expression, changed bool) {
 	if f, ok := expr.(*ScalarFunction); ok {
 		switch f.FuncName.L {
 		case ast.UnaryNot:
-			return pushNotAcrossExpr(f.GetCtx(), f.GetArgs()[0], !not)
+			child, err := wrapWithIsTrue(ctx, true, f.GetArgs()[0], true)
+			if err != nil {
+				return expr, false
+			}
+			var childExpr Expression
+			childExpr, changed = pushNotAcrossExpr(f.GetCtx(), child, !not)
+			if !changed && !not {
+				return expr, false
+			}
+			return childExpr, true
 		case ast.LT, ast.GE, ast.GT, ast.LE, ast.EQ, ast.NE:
 			if not {
 				return NewFunctionInternal(f.GetCtx(), oppositeOp[f.FuncName.L], f.GetType(), f.GetArgs()...), true
@@ -588,47 +654,11 @@ func PopRowFirstArg(ctx sessionctx.Context, e Expression) (ret Expression, err e
 	return
 }
 
-// exprStack is a stack of expressions.
-type exprStack struct {
-	stack []Expression
-}
-
-// pop pops an expression from the stack.
-func (s *exprStack) pop() Expression {
-	if s.len() == 0 {
-		return nil
-	}
-	lastIdx := s.len() - 1
-	expr := s.stack[lastIdx]
-	s.stack = s.stack[:lastIdx]
-	return expr
-}
-
-// popN pops n expressions from the stack.
-// If n greater than stack length or n is negative, it pops all the expressions.
-func (s *exprStack) popN(n int) []Expression {
-	if n > s.len() || n < 0 {
-		n = s.len()
-	}
-	idx := s.len() - n
-	exprs := s.stack[idx:]
-	s.stack = s.stack[:idx]
-	return exprs
-}
-
-// push pushes one expression to the stack.
-func (s *exprStack) push(expr Expression) {
-	s.stack = append(s.stack, expr)
-}
-
-// len returns the length of th stack.
-func (s *exprStack) len() int {
-	return len(s.stack)
-}
-
 // DatumToConstant generates a Constant expression from a Datum.
-func DatumToConstant(d types.Datum, tp byte) *Constant {
-	return &Constant{Value: d, RetType: types.NewFieldType(tp)}
+func DatumToConstant(d types.Datum, tp byte, flag uint) *Constant {
+	t := types.NewFieldType(tp)
+	t.Flag |= flag
+	return &Constant{Value: d, RetType: t}
 }
 
 // ParamMarkerExpression generate a getparam function expression.
@@ -718,6 +748,27 @@ func BuildNotNullExpr(ctx sessionctx.Context, expr Expression) Expression {
 	return notNull
 }
 
+// IsRuntimeConstExpr checks if a expr can be treated as a constant in **executor**.
+func IsRuntimeConstExpr(expr Expression) bool {
+	switch x := expr.(type) {
+	case *ScalarFunction:
+		if _, ok := unFoldableFunctions[x.FuncName.L]; ok {
+			return false
+		}
+		for _, arg := range x.GetArgs() {
+			if !IsRuntimeConstExpr(arg) {
+				return false
+			}
+		}
+		return true
+	case *Column:
+		return false
+	case *Constant, *CorrelatedColumn:
+		return true
+	}
+	return false
+}
+
 // IsMutableEffectsExpr checks if expr contains function which is mutable or has side effects.
 func IsMutableEffectsExpr(expr Expression) bool {
 	switch x := expr.(type) {
@@ -803,6 +854,21 @@ func ContainVirtualColumn(exprs []Expression) bool {
 			}
 		case *ScalarFunction:
 			if ContainVirtualColumn(v.GetArgs()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ContainCorrelatedColumn checks if the expressions contain a correlated column
+func ContainCorrelatedColumn(exprs []Expression) bool {
+	for _, expr := range exprs {
+		switch v := expr.(type) {
+		case *CorrelatedColumn:
+			return true
+		case *ScalarFunction:
+			if ContainCorrelatedColumn(v.GetArgs()) {
 				return true
 			}
 		}

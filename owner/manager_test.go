@@ -10,19 +10,21 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // See the License for the specific language governing permissions and
 // limitations under the License.
-// +build !windows
 
 package owner_test
 
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
+	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/terror"
 	. "github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/util/logutil"
@@ -34,11 +36,15 @@ import (
 
 const testLease = 5 * time.Millisecond
 
+func TestT(t *testing.T) {
+	TestingT(t)
+}
+
 func checkOwner(d DDL, fbVal bool) (isOwner bool) {
 	manager := d.OwnerManager()
-	// The longest to wait for 3 seconds to
+	// The longest to wait for 30 seconds to
 	// make sure that campaigning owners is completed.
-	for i := 0; i < 600; i++ {
+	for i := 0; i < 6000; i++ {
 		time.Sleep(5 * time.Millisecond)
 		isOwner = manager.IsOwner()
 		if isOwner == fbVal {
@@ -48,26 +54,41 @@ func checkOwner(d DDL, fbVal bool) (isOwner bool) {
 	return
 }
 
-// Ignore this test on the windows platform, because calling unix socket with address in
-// host:port format fails on windows.
 func TestSingle(t *testing.T) {
-	store, err := mockstore.NewMockTikvStore()
+	if runtime.GOOS == "windows" {
+		t.Skip("integration.NewClusterV3 will create file contains a colon which is not allowed on Windows")
+	}
+	store, err := mockstore.NewMockStore()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		err := store.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
 
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
 	cli := clus.RandClient()
 	ctx := goctx.Background()
+	ic := infoschema.NewCache(2)
+	ic.Insert(infoschema.MockInfoSchemaWithSchemaVer(nil, 0), 0)
 	d := NewDDL(
 		ctx,
 		WithEtcdClient(cli),
 		WithStore(store),
 		WithLease(testLease),
+		WithInfoCache(ic),
 	)
-	defer d.Stop()
+	err = d.Start(nil)
+	if err != nil {
+		t.Fatalf("DDL start failed %v", err)
+	}
+	defer func() {
+		_ = d.Stop()
+	}()
 
 	isOwner := checkOwner(d, true)
 	if !isOwner {
@@ -76,9 +97,9 @@ func TestSingle(t *testing.T) {
 
 	// test for newSession failed
 	ctx, cancel := goctx.WithCancel(ctx)
+	manager := owner.NewOwnerManager(ctx, cli, "ddl", "ddl_id", DDLOwnerKey)
 	cancel()
-	manager := owner.NewOwnerManager(cli, "ddl", "ddl_id", DDLOwnerKey, nil)
-	err = manager.CampaignOwner(ctx)
+	err = manager.CampaignOwner()
 	if !terror.ErrorEqual(err, goctx.Canceled) &&
 		!terror.ErrorEqual(err, goctx.DeadlineExceeded) {
 		t.Fatalf("campaigned result don't match, err %v", err)
@@ -102,38 +123,60 @@ func TestSingle(t *testing.T) {
 }
 
 func TestCluster(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("integration.NewClusterV3 will create file contains a colon which is not allowed on Windows")
+	}
 	tmpTTL := 3
 	orignalTTL := owner.ManagerSessionTTL
 	owner.ManagerSessionTTL = tmpTTL
 	defer func() {
 		owner.ManagerSessionTTL = orignalTTL
 	}()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		err := store.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 4})
 	defer clus.Terminate(t)
 
 	cli := clus.Client(0)
+	ic := infoschema.NewCache(2)
+	ic.Insert(infoschema.MockInfoSchemaWithSchemaVer(nil, 0), 0)
 	d := NewDDL(
 		goctx.Background(),
 		WithEtcdClient(cli),
 		WithStore(store),
 		WithLease(testLease),
+		WithInfoCache(ic),
 	)
+	err = d.Start(nil)
+	if err != nil {
+		t.Fatalf("DDL start failed %v", err)
+	}
 	isOwner := checkOwner(d, true)
 	if !isOwner {
 		t.Fatalf("expect true, got isOwner:%v", isOwner)
 	}
 	cli1 := clus.Client(1)
+	ic2 := infoschema.NewCache(2)
+	ic2.Insert(infoschema.MockInfoSchemaWithSchemaVer(nil, 0), 0)
 	d1 := NewDDL(
 		goctx.Background(),
 		WithEtcdClient(cli1),
 		WithStore(store),
 		WithLease(testLease),
+		WithInfoCache(ic2),
 	)
+	err = d1.Start(nil)
+	if err != nil {
+		t.Fatalf("DDL start failed %v", err)
+	}
 	isOwner = checkOwner(d1, false)
 	if isOwner {
 		t.Fatalf("expect false, got isOwner:%v", isOwner)
@@ -149,25 +192,46 @@ func TestCluster(t *testing.T) {
 	if isOwner {
 		t.Fatalf("expect false, got isOwner:%v", isOwner)
 	}
-	d.Stop()
+	err = d.Stop()
+	if err != nil {
+		t.Fatal(err, IsNil)
+	}
 
 	// d3 (not owner) stop
 	cli3 := clus.Client(3)
+	ic3 := infoschema.NewCache(2)
+	ic3.Insert(infoschema.MockInfoSchemaWithSchemaVer(nil, 0), 0)
 	d3 := NewDDL(
 		goctx.Background(),
 		WithEtcdClient(cli3),
 		WithStore(store),
 		WithLease(testLease),
+		WithInfoCache(ic3),
 	)
-	defer d3.Stop()
+	err = d3.Start(nil)
+	if err != nil {
+		t.Fatalf("DDL start failed %v", err)
+	}
+	defer func() {
+		err = d3.Stop()
+		if err != nil {
+			t.Fatal(err, IsNil)
+		}
+	}()
 	isOwner = checkOwner(d3, false)
 	if isOwner {
 		t.Fatalf("expect false, got isOwner:%v", isOwner)
 	}
-	d3.Stop()
+	err = d3.Stop()
+	if err != nil {
+		t.Fatal(err, IsNil)
+	}
 
 	// Cancel the owner context, there is no owner.
-	d1.Stop()
+	err = d1.Stop()
+	if err != nil {
+		t.Fatal(err, IsNil)
+	}
 	time.Sleep(time.Duration(tmpTTL+1) * time.Second)
 	session, err := concurrency.NewSession(cliRW)
 	if err != nil {

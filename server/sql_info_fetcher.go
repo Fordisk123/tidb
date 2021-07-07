@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -31,14 +30,15 @@ import (
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/statistics/handle"
-	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/sqlexec"
+	"github.com/pingcap/tidb/util/topsql/tracecpu"
 )
 
 type sqlInfoFetcher struct {
-	store tikv.Storage
+	store kv.Storage
 	do    *domain.Domain
 	s     session.Session
 }
@@ -81,6 +81,7 @@ func (sh *sqlInfoFetcher) zipInfoForSQL(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer sh.s.Close()
+
 	sh.do = domain.GetDomain(sh.s)
 	reqCtx := r.Context()
 	sql := r.FormValue("sql")
@@ -88,7 +89,7 @@ func (sh *sqlInfoFetcher) zipInfoForSQL(w http.ResponseWriter, r *http.Request) 
 	timeoutString := r.FormValue("timeout")
 	curDB := strings.ToLower(r.FormValue("current_db"))
 	if curDB != "" {
-		_, err = sh.s.Execute(reqCtx, fmt.Sprintf("use %v", curDB))
+		_, err = sh.s.ExecuteInternal(context.Background(), "use %n", curDB)
 		if err != nil {
 			serveError(w, http.StatusInternalServerError, fmt.Sprintf("use database %v failed, err: %v", curDB, err))
 			return
@@ -258,9 +259,6 @@ type explainAnalyzeResult struct {
 
 func (sh *sqlInfoFetcher) getExplainAnalyze(ctx context.Context, sql string, resultChan chan<- *explainAnalyzeResult) {
 	recordSets, err := sh.s.(sqlexec.SQLExecutor).Execute(ctx, fmt.Sprintf("explain analyze %s", sql))
-	if len(recordSets) > 0 {
-		defer terror.Call(recordSets[0].Close)
-	}
 	if err != nil {
 		resultChan <- &explainAnalyzeResult{err: err}
 		return
@@ -270,17 +268,20 @@ func (sh *sqlInfoFetcher) getExplainAnalyze(ctx context.Context, sql string, res
 		terror.Log(err)
 		return
 	}
+	if len(recordSets) > 0 {
+		terror.Call(recordSets[0].Close)
+	}
 	resultChan <- &explainAnalyzeResult{rows: rows}
 }
 
 func (sh *sqlInfoFetcher) catchCPUProfile(ctx context.Context, sec int, buf *bytes.Buffer, errChan chan<- error) {
-	if err := pprof.StartCPUProfile(buf); err != nil {
+	if err := tracecpu.StartCPUProfile(buf); err != nil {
 		errChan <- err
 		return
 	}
 	sleepWithCtx(ctx, time.Duration(sec)*time.Second)
-	pprof.StopCPUProfile()
-	errChan <- nil
+	err := tracecpu.StopCPUProfile()
+	errChan <- err
 }
 
 func (sh *sqlInfoFetcher) getStatsForTable(pair tableNamePair) (*handle.JSONTable, error) {

@@ -21,11 +21,11 @@ import (
 	"math/rand"
 	"net"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/auth"
@@ -190,8 +190,8 @@ func BenchmarkVectorizedExecute(b *testing.B) {
 
 func BenchmarkScalarFunctionClone(b *testing.B) {
 	col := &Column{RetType: types.NewFieldType(mysql.TypeLonglong)}
-	con1 := One.Clone()
-	con2 := Zero.Clone()
+	con1 := NewOne()
+	con2 := NewZero()
 	add := NewFunctionInternal(mock.NewContext(), ast.Plus, types.NewFieldType(mysql.TypeLonglong), col, con1)
 	sub := NewFunctionInternal(mock.NewContext(), ast.Plus, types.NewFieldType(mysql.TypeLonglong), add, con2)
 	b.ResetTimer()
@@ -264,6 +264,13 @@ func (g *defaultGener) gen() interface{} {
 	case types.ETDatetime, types.ETTimestamp:
 		gt := getRandomTime(g.randGen.Rand)
 		t := types.NewTime(gt, convertETType(g.eType), 0)
+		// TiDB has DST time problem, and it causes ErrWrongValue.
+		// We should ignore ambiguous Time. See https://timezonedb.com/time-zones/Asia/Shanghai.
+		for _, err := t.GoTime(time.Local); err != nil; {
+			gt = getRandomTime(g.randGen.Rand)
+			t = types.NewTime(gt, convertETType(g.eType), 0)
+			_, err = t.GoTime(time.Local)
+		}
 		return t
 	case types.ETDuration:
 		d := types.Duration{
@@ -287,23 +294,9 @@ func (g *defaultGener) gen() interface{} {
 type charInt64Gener struct{}
 
 func (g *charInt64Gener) gen() interface{} {
-	rand := time.Now().Nanosecond()
-	rand = rand % 1024
-	return int64(rand)
-}
-
-// charsetStringGener is used to generate "ascii" or "gbk"
-type charsetStringGener struct{}
-
-func (g *charsetStringGener) gen() interface{} {
-	rand := time.Now().Nanosecond() % 3
-	if rand == 0 {
-		return "ascii"
-	}
-	if rand == 1 {
-		return "utf8"
-	}
-	return "gbk"
+	nanosecond := time.Now().Nanosecond()
+	nanosecond = nanosecond % 1024
+	return int64(nanosecond)
 }
 
 // selectStringGener select one string randomly from the candidates array
@@ -642,6 +635,27 @@ func (g *ipv4MappedByteGener) gen() interface{} {
 	return string(ip[:net.IPv6len])
 }
 
+// uuidStrGener is used to generate uuid strings.
+type uuidStrGener struct {
+	randGen *defaultRandGen
+}
+
+func (g *uuidStrGener) gen() interface{} {
+	u, _ := uuid.NewUUID()
+	return u.String()
+}
+
+// uuidBinGener is used to generate uuid binarys.
+type uuidBinGener struct {
+	randGen *defaultRandGen
+}
+
+func (g *uuidBinGener) gen() interface{} {
+	u, _ := uuid.NewUUID()
+	bin, _ := u.MarshalBinary()
+	return string(bin)
+}
+
 // randLenStrGener is used to generate strings whose lengths are in [lenBegin, lenEnd).
 type randLenStrGener struct {
 	lenBegin int
@@ -704,10 +718,6 @@ type dateTimeGener struct {
 	Month   int
 	Day     int
 	randGen *defaultRandGen
-}
-
-func newDateTimeGener(fsp, year, month, day int) *dateTimeGener {
-	return &dateTimeGener{fsp, year, month, day, newDefaultRandGen()}
 }
 
 func (g *dateTimeGener) gen() interface{} {
@@ -780,10 +790,10 @@ func (g *dateStrGener) gen() interface{} {
 		g.Year = 1970 + g.randGen.Intn(100)
 	}
 	if g.Month == 0 {
-		g.Month = g.randGen.Intn(10) + 1
+		g.Month = g.randGen.Intn(10)
 	}
 	if g.Day == 0 {
-		g.Day = g.randGen.Intn(20) + 1
+		g.Day = g.randGen.Intn(20)
 	}
 
 	return fmt.Sprintf("%d-%d-%d", g.Year, g.Month, g.Day)
@@ -868,12 +878,6 @@ func newRandDurDecimal() *randDurDecimal {
 func (g *randDurDecimal) gen() interface{} {
 	d := new(types.MyDecimal)
 	return d.FromFloat64(float64(g.randGen.Intn(types.TimeMaxHour)*10000 + g.randGen.Intn(60)*100 + g.randGen.Intn(60)))
-}
-
-type randDurString struct{}
-
-func (g *randDurString) gen() interface{} {
-	return strconv.Itoa(rand.Intn(types.TimeMaxHour)*10000 + rand.Intn(60)*100 + rand.Intn(60))
 }
 
 // locationGener is used to generate location for the built-in function GetFormat.
@@ -1244,6 +1248,20 @@ func genVecBuiltinFuncBenchCase(ctx sessionctx.Context, funcName string, testCas
 			fc = &castAsStringFunctionClass{baseFunctionClass{ast.Cast, 1, 1}, tp}
 		}
 		baseFunc, err = fc.getFunction(ctx, cols)
+	} else if funcName == ast.GetVar {
+		var fc functionClass
+		tp := eType2FieldType(testCase.retEvalType)
+		switch testCase.retEvalType {
+		case types.ETInt:
+			fc = &getIntVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		case types.ETDecimal:
+			fc = &getDecimalVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		case types.ETReal:
+			fc = &getRealVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		default:
+			fc = &getStringVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		}
+		baseFunc, err = fc.getFunction(ctx, cols)
 	} else {
 		baseFunc, err = funcs[funcName].getFunction(ctx, cols)
 	}
@@ -1308,12 +1326,12 @@ func testVectorizedBuiltinFunc(c *C, vecExprCases vecExprBenchCases) {
 					types.NewTimeDatum(types.NewTime(types.FromGoTime(testTime), mysql.TypeTimestamp, 6)),
 					types.NewDurationDatum(types.ZeroDuration),
 					types.NewStringDatum("{}"),
-					types.NewBinaryLiteralDatum(types.BinaryLiteral([]byte{1})),
+					types.NewBinaryLiteralDatum([]byte{1}),
 					types.NewBytesDatum([]byte{'b'}),
 					types.NewFloat32Datum(1.1),
 					types.NewFloat64Datum(2.1),
 					types.NewUintDatum(100),
-					types.NewMysqlBitDatum(types.BinaryLiteral([]byte{1})),
+					types.NewMysqlBitDatum([]byte{1}),
 					types.NewMysqlEnumDatum(types.Enum{Name: "n", Value: 2}),
 				}
 			}
@@ -1527,12 +1545,12 @@ func benchmarkVectorizedBuiltinFunc(b *testing.B, vecExprCases vecExprBenchCases
 					types.NewTimeDatum(types.NewTime(types.FromGoTime(testTime), mysql.TypeTimestamp, 6)),
 					types.NewDurationDatum(types.ZeroDuration),
 					types.NewStringDatum("{}"),
-					types.NewBinaryLiteralDatum(types.BinaryLiteral([]byte{1})),
+					types.NewBinaryLiteralDatum([]byte{1}),
 					types.NewBytesDatum([]byte{'b'}),
 					types.NewFloat32Datum(1.1),
 					types.NewFloat64Datum(2.1),
 					types.NewUintDatum(100),
-					types.NewMysqlBitDatum(types.BinaryLiteral([]byte{1})),
+					types.NewMysqlBitDatum([]byte{1}),
 					types.NewMysqlEnumDatum(types.Enum{Name: "n", Value: 2}),
 				}
 			}
@@ -1751,7 +1769,7 @@ func genVecEvalBool(numCols int, colTypes, eTypes []types.EvalType) (CNFExprs, *
 
 func generateRandomSel() []int {
 	randGen := newDefaultRandGen()
-	randGen.Seed(int64(time.Now().UnixNano()))
+	randGen.Seed(time.Now().UnixNano())
 	var sel []int
 	count := 0
 	// Use constant 256 to make it faster to generate randomly arranged sel slices
@@ -1794,21 +1812,6 @@ func (s *testVectorizeSuite2) TestVecEvalBool(c *C) {
 			}
 		}
 	}
-}
-
-func (s *testVectorizeSuite2) TestVecToBool(c *C) {
-	ctx := mock.NewContext()
-	buf := chunk.NewColumn(eType2FieldType(types.ETString), 2)
-	buf.ReserveString(1)
-	buf.AppendString("999999999999999999923")
-	c.Assert(toBool(ctx.GetSessionVars().StmtCtx, types.ETString, buf, []int{0, 1}, []int8{0, 0}), NotNil)
-	buf.ReserveString(1)
-	buf.AppendString("23")
-	c.Assert(toBool(ctx.GetSessionVars().StmtCtx, types.ETString, buf, []int{0, 1}, []int8{0, 0}), IsNil)
-	buf.ReserveString(2)
-	buf.AppendString("999999999999999999923")
-	buf.AppendString("23")
-	c.Assert(toBool(ctx.GetSessionVars().StmtCtx, types.ETString, buf, []int{0, 1}, []int8{0, 0}), NotNil)
 }
 
 func BenchmarkVecEvalBool(b *testing.B) {

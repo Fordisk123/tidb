@@ -14,58 +14,66 @@
 package collate
 
 import (
-	"strings"
+	"sort"
 	"sync/atomic"
 
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/logutil"
-	"github.com/pingcap/tidb/util/stringutil"
 	"go.uber.org/zap"
 )
 
 var (
-	collatorMap         map[string]Collator
-	collatorIDMap       map[int]Collator
 	newCollatorMap      map[string]Collator
 	newCollatorIDMap    map[int]Collator
 	newCollationEnabled int32
+
+	// binCollatorInstance is a singleton used for all collations when newCollationEnabled is false.
+	binCollatorInstance = &binCollator{}
+
+	// ErrUnsupportedCollation is returned when an unsupported collation is specified.
+	ErrUnsupportedCollation = dbterror.ClassDDL.NewStdErr(mysql.ErrUnknownCollation, mysql.Message("Unsupported collation when new collation is enabled: '%-.64s'", nil))
+	// ErrIllegalMixCollation is returned when illegal mix of collations.
+	ErrIllegalMixCollation = dbterror.ClassExpression.NewStd(mysql.ErrCantAggregateNcollations)
+	// ErrIllegalMix2Collation is returned when illegal mix of 2 collations.
+	ErrIllegalMix2Collation = dbterror.ClassExpression.NewStd(mysql.ErrCantAggregate2collations)
+	// ErrIllegalMix3Collation is returned when illegal mix of 3 collations.
+	ErrIllegalMix3Collation = dbterror.ClassExpression.NewStd(mysql.ErrCantAggregate3collations)
 )
 
-// DefaultLen is set for datum if the string datum don't know its length.
 const (
+	// DefaultLen is set for datum if the string datum don't know its length.
 	DefaultLen = 0
+	// first byte of a 2-byte encoding starts 110 and carries 5 bits of data
+	b2Mask = 0x1F // 0001 1111
+	// first byte of a 3-byte encoding starts 1110 and carries 4 bits of data
+	b3Mask = 0x0F // 0000 1111
+	// first byte of a 4-byte encoding starts 11110 and carries 3 bits of data
+	b4Mask = 0x07 // 0000 0111
+	// non-first bytes start 10 and carry 6 bits of data
+	mbMask = 0x3F // 0011 1111
 )
-
-// CompatibleCollate checks whether the two collate are the same.
-func CompatibleCollate(collate1, collate2 string) bool {
-	if (collate1 == "utf8mb4_general_ci" || collate1 == "utf8_general_ci") && (collate2 == "utf8mb4_general_ci" || collate2 == "utf8_general_ci") {
-		return true
-	} else if (collate1 == "utf8mb4_bin" || collate1 == "utf8_bin") && (collate2 == "utf8mb4_bin" || collate2 == "utf8_bin") {
-		return true
-	} else {
-		return collate1 == collate2
-	}
-}
-
-// CollatorOption is the option of collator.
-type CollatorOption struct {
-	PadLen int
-}
-
-// NewCollatorOption creates a new CollatorOption with the specified arguments.
-func NewCollatorOption(padLen int) CollatorOption {
-	return CollatorOption{padLen}
-}
 
 // Collator provides functionality for comparing strings for a given
 // collation order.
 type Collator interface {
 	// Compare returns an integer comparing the two strings. The result will be 0 if a == b, -1 if a < b, and +1 if a > b.
-	Compare(a, b string, opt CollatorOption) int
+	Compare(a, b string) int
 	// Key returns the collate key for str. If the collation is padding, make sure the PadLen >= len(rune[]str) in opt.
-	Key(str string, opt CollatorOption) []byte
+	Key(str string) []byte
 	// Pattern get a collation-aware WildcardPattern.
 	Pattern() WildcardPattern
+}
+
+// WildcardPattern is the interface used for wildcard pattern match.
+type WildcardPattern interface {
+	// Compile compiles the patternStr with specified escape character.
+	Compile(patternStr string, escape byte)
+	// DoMatch tries to match the str with compiled pattern, `Compile()` must be called before calling it.
+	DoMatch(str string) bool
 }
 
 // EnableNewCollations enables the new collation.
@@ -86,6 +94,19 @@ func SetNewCollationEnabledForTest(flag bool) {
 // NewCollationEnabled returns if the new collations are enabled.
 func NewCollationEnabled() bool {
 	return atomic.LoadInt32(&newCollationEnabled) == 1
+}
+
+// CompatibleCollate checks whether the two collate are the same.
+func CompatibleCollate(collate1, collate2 string) bool {
+	if (collate1 == "utf8mb4_general_ci" || collate1 == "utf8_general_ci") && (collate2 == "utf8mb4_general_ci" || collate2 == "utf8_general_ci") {
+		return true
+	} else if (collate1 == "utf8mb4_bin" || collate1 == "utf8_bin") && (collate2 == "utf8mb4_bin" || collate2 == "utf8_bin") {
+		return true
+	} else if (collate1 == "utf8mb4_unicode_ci" || collate1 == "utf8_unicode_ci") && (collate2 == "utf8mb4_unicode_ci" || collate2 == "utf8_unicode_ci") {
+		return true
+	} else {
+		return collate1 == collate2
+	}
 }
 
 // RewriteNewCollationIDIfNeeded rewrites a collation id if the new collations are enabled.
@@ -121,15 +142,15 @@ func GetCollator(collate string) Collator {
 	if atomic.LoadInt32(&newCollationEnabled) == 1 {
 		ctor, ok := newCollatorMap[collate]
 		if !ok {
+			logutil.BgLogger().Warn(
+				"Unable to get collator by name, use binCollator instead.",
+				zap.String("name", collate),
+				zap.Stack("stack"))
 			return newCollatorMap["utf8mb4_bin"]
 		}
 		return ctor
 	}
-	ctor, ok := collatorMap[collate]
-	if !ok {
-		return collatorMap["utf8mb4_bin"]
-	}
-	return ctor
+	return binCollatorInstance
 }
 
 // GetCollatorByID get the collator according to id, it will return the binary collator if the corresponding collator doesn't exist.
@@ -137,46 +158,91 @@ func GetCollatorByID(id int) Collator {
 	if atomic.LoadInt32(&newCollationEnabled) == 1 {
 		ctor, ok := newCollatorIDMap[id]
 		if !ok {
+			logutil.BgLogger().Warn(
+				"Unable to get collator by ID, use binCollator instead.",
+				zap.Int("ID", id),
+				zap.Stack("stack"))
 			return newCollatorMap["utf8mb4_bin"]
 		}
 		return ctor
 	}
-	ctor, ok := collatorIDMap[id]
-	if !ok {
-		return collatorMap["utf8mb4_bin"]
-	}
-	return ctor
-}
-
-type binCollator struct {
-}
-
-// Compare implement Collator interface.
-func (bc *binCollator) Compare(a, b string, opt CollatorOption) int {
-	return strings.Compare(a, b)
-}
-
-// Key implement Collator interface.
-func (bc *binCollator) Key(str string, opt CollatorOption) []byte {
-	return []byte(str)
-}
-
-// Pattern implements Collator interface.
-func (bc *binCollator) Pattern() WildcardPattern {
-	return &binPattern{}
+	return binCollatorInstance
 }
 
 // CollationID2Name return the collation name by the given id.
 // If the id is not found in the map, the default collation is returned.
 func CollationID2Name(id int32) string {
-	name, ok := mysql.Collations[uint8(id)]
-	if !ok {
+	collation, err := charset.GetCollationByID(int(id))
+	if err != nil {
+		// TODO(bb7133): fix repeating logs when the following code is uncommented.
+		// logutil.BgLogger().Warn(
+		// 	"Unable to get collation name from ID, use default collation instead.",
+		// 	zap.Int32("ID", id),
+		// 	zap.Stack("stack"))
 		return mysql.DefaultCollationName
 	}
-	return name
+	return collation.Name
 }
 
-type binPaddingCollator struct {
+// CollationName2ID return the collation id by the given name.
+// If the name is not found in the map, the default collation id is returned
+func CollationName2ID(name string) int {
+	if coll, err := charset.GetCollationByName(name); err == nil {
+		return coll.ID
+	}
+	return mysql.DefaultCollationID
+}
+
+// SubstituteMissingCollationToDefault will switch to the default collation if
+// new collations are enabled and the specified collation is not supported.
+func SubstituteMissingCollationToDefault(co string) string {
+	var err error
+	if _, err = GetCollationByName(co); err == nil {
+		return co
+	}
+	logutil.BgLogger().Warn(err.Error())
+	var coll *charset.Collation
+	if coll, err = GetCollationByName(charset.CollationUTF8MB4); err != nil {
+		logutil.BgLogger().Warn(err.Error())
+	}
+	return coll.Name
+}
+
+// GetCollationByName wraps charset.GetCollationByName, it checks the collation.
+func GetCollationByName(name string) (coll *charset.Collation, err error) {
+	if coll, err = charset.GetCollationByName(name); err != nil {
+		return nil, errors.Trace(err)
+	}
+	if atomic.LoadInt32(&newCollationEnabled) == 1 {
+		if _, ok := newCollatorIDMap[coll.ID]; !ok {
+			return nil, ErrUnsupportedCollation.GenWithStackByArgs(name)
+		}
+	}
+	return
+}
+
+// GetSupportedCollations gets information for all collations supported so far.
+func GetSupportedCollations() []*charset.Collation {
+	if atomic.LoadInt32(&newCollationEnabled) == 1 {
+		newSupportedCollations := make([]*charset.Collation, 0, len(newCollatorMap))
+		for name := range newCollatorMap {
+			// utf8mb4_zh_pinyin_tidb_as_cs is under developing, should not be shown to user.
+			if name == "utf8mb4_zh_pinyin_tidb_as_cs" {
+				continue
+			}
+			if coll, err := charset.GetCollationByName(name); err != nil {
+				// Should never happens.
+				terror.Log(err)
+			} else {
+				newSupportedCollations = append(newSupportedCollations, coll)
+			}
+		}
+		sort.Slice(newSupportedCollations, func(i int, j int) bool {
+			return newSupportedCollations[i].Name < newSupportedCollations[j].Name
+		})
+		return newSupportedCollations
+	}
+	return charset.GetSupportedCollations()
 }
 
 func truncateTailingSpace(str string) string {
@@ -191,71 +257,74 @@ func truncateTailingSpace(str string) string {
 	return str
 }
 
-func (bpc *binPaddingCollator) Compare(a, b string, opt CollatorOption) int {
-	return strings.Compare(truncateTailingSpace(a), truncateTailingSpace(b))
+func sign(i int) int {
+	if i < 0 {
+		return -1
+	} else if i > 0 {
+		return 1
+	}
+	return 0
 }
 
-func (bpc *binPaddingCollator) Key(str string, opt CollatorOption) []byte {
-	return []byte(truncateTailingSpace(str))
+// decode rune by hand
+func decodeRune(s string, si int) (r rune, newIndex int) {
+	switch b := s[si]; {
+	case b < 0x80:
+		r = rune(b)
+		newIndex = si + 1
+	case b < 0xE0:
+		r = rune(b&b2Mask)<<6 |
+			rune(s[1+si]&mbMask)
+		newIndex = si + 2
+	case b < 0xF0:
+		r = rune(b&b3Mask)<<12 |
+			rune(s[si+1]&mbMask)<<6 |
+			rune(s[si+2]&mbMask)
+		newIndex = si + 3
+	default:
+		r = rune(b&b4Mask)<<18 |
+			rune(s[si+1]&mbMask)<<12 |
+			rune(s[si+2]&mbMask)<<6 |
+			rune(s[si+3]&mbMask)
+		newIndex = si + 4
+	}
+	return
 }
 
-// Pattern implements Collator interface.
-// Notice that trailing spaces are significant.
-func (bpc *binPaddingCollator) Pattern() WildcardPattern {
-	return &binPattern{}
+// IsCICollation returns if the collation is case-sensitive
+func IsCICollation(collate string) bool {
+	return collate == "utf8_general_ci" || collate == "utf8mb4_general_ci" ||
+		collate == "utf8_unicode_ci" || collate == "utf8mb4_unicode_ci"
 }
 
-// WildcardPattern is the interface used for wildcard pattern match.
-type WildcardPattern interface {
-	// Compile compiles the patternStr with specified escape character.
-	Compile(patternStr string, escape byte)
-	// DoMatch tries to match the str with compiled pattern, `Compile()` must be called before calling it.
-	DoMatch(str string) bool
-}
-
-type binPattern struct {
-	patChars []byte
-	patTypes []byte
-}
-
-// Compile implements WildcardPattern interface.
-func (p *binPattern) Compile(patternStr string, escape byte) {
-	p.patChars, p.patTypes = stringutil.CompilePattern(patternStr, escape)
-}
-
-// Compile implements WildcardPattern interface.
-func (p *binPattern) DoMatch(str string) bool {
-	return stringutil.DoMatch(str, p.patChars, p.patTypes)
+// IsBinCollation returns if the collation is 'xx_bin'
+func IsBinCollation(collate string) bool {
+	return collate == "ascii_bin" || collate == "latin1_bin" ||
+		collate == "utf8_bin" || collate == "utf8mb4_bin"
 }
 
 func init() {
-	collatorMap = make(map[string]Collator)
-	collatorIDMap = make(map[int]Collator)
 	newCollatorMap = make(map[string]Collator)
 	newCollatorIDMap = make(map[int]Collator)
 
-	collatorMap["binary"] = &binCollator{}
-	collatorMap["utf8mb4_bin"] = &binCollator{}
-	collatorMap["utf8_bin"] = &binCollator{}
-	collatorMap["utf8mb4_general_ci"] = &binCollator{}
-	collatorMap["utf8_general_ci"] = &binCollator{}
-
-	// See https://github.com/pingcap/parser/blob/master/charset/charset.go for more information about the IDs.
-	collatorIDMap[63] = &binCollator{}
-	collatorIDMap[46] = &binCollator{}
-	collatorIDMap[83] = &binCollator{}
-	collatorIDMap[45] = &binCollator{}
-	collatorIDMap[33] = &binCollator{}
-
 	newCollatorMap["binary"] = &binCollator{}
+	newCollatorIDMap[CollationName2ID("binary")] = &binCollator{}
+	newCollatorMap["ascii_bin"] = &binPaddingCollator{}
+	newCollatorIDMap[CollationName2ID("ascii_bin")] = &binPaddingCollator{}
+	newCollatorMap["latin1_bin"] = &binPaddingCollator{}
+	newCollatorIDMap[CollationName2ID("latin1_bin")] = &binPaddingCollator{}
 	newCollatorMap["utf8mb4_bin"] = &binPaddingCollator{}
+	newCollatorIDMap[CollationName2ID("utf8mb4_bin")] = &binPaddingCollator{}
 	newCollatorMap["utf8_bin"] = &binPaddingCollator{}
+	newCollatorIDMap[CollationName2ID("utf8_bin")] = &binPaddingCollator{}
 	newCollatorMap["utf8mb4_general_ci"] = &generalCICollator{}
+	newCollatorIDMap[CollationName2ID("utf8mb4_general_ci")] = &generalCICollator{}
 	newCollatorMap["utf8_general_ci"] = &generalCICollator{}
-
-	newCollatorIDMap[63] = &binCollator{}
-	newCollatorIDMap[46] = &binPaddingCollator{}
-	newCollatorIDMap[83] = &binPaddingCollator{}
-	newCollatorIDMap[45] = &generalCICollator{}
-	newCollatorIDMap[33] = &generalCICollator{}
+	newCollatorIDMap[CollationName2ID("utf8_general_ci")] = &generalCICollator{}
+	newCollatorMap["utf8mb4_unicode_ci"] = &unicodeCICollator{}
+	newCollatorIDMap[CollationName2ID("utf8mb4_unicode_ci")] = &unicodeCICollator{}
+	newCollatorMap["utf8_unicode_ci"] = &unicodeCICollator{}
+	newCollatorIDMap[CollationName2ID("utf8_unicode_ci")] = &unicodeCICollator{}
+	newCollatorMap["utf8mb4_zh_pinyin_tidb_as_cs"] = &zhPinyinTiDBASCSCollator{}
+	newCollatorIDMap[CollationName2ID("utf8mb4_zh_pinyin_tidb_as_cs")] = &zhPinyinTiDBASCSCollator{}
 }

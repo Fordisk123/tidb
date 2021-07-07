@@ -15,6 +15,7 @@ package binloginfo_test
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -35,6 +36,7 @@ import (
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
@@ -50,7 +52,10 @@ import (
 func TestT(t *testing.T) {
 	CustomVerboseFlag = true
 	logLevel := os.Getenv("log_level")
-	logutil.InitLogger(logutil.NewLogConfig(logLevel, logutil.DefaultLogFormat, "", logutil.EmptyFileLogConfig, false))
+	err := logutil.InitLogger(logutil.NewLogConfig(logLevel, logutil.DefaultLogFormat, "", logutil.EmptyFileLogConfig, false))
+	if err != nil {
+		t.Fatal(err)
+	}
 	TestingT(t)
 }
 
@@ -78,7 +83,7 @@ func (p *mockBinlogPump) PullBinlogs(req *binlog.PullBinlogReq, srv binlog.Pump_
 	return nil
 }
 
-var _ = Suite(&testBinlogSuite{})
+var _ = SerialSuites(&testBinlogSuite{})
 
 type testBinlogSuite struct {
 	store    kv.Storage
@@ -93,7 +98,7 @@ type testBinlogSuite struct {
 const maxRecvMsgSize = 64 * 1024
 
 func (s *testBinlogSuite) SetUpSuite(c *C) {
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	s.store = store
 	session.SetSchemaLease(0)
@@ -103,7 +108,10 @@ func (s *testBinlogSuite) SetUpSuite(c *C) {
 	s.serv = grpc.NewServer(grpc.MaxRecvMsgSize(maxRecvMsgSize))
 	s.pump = new(mockBinlogPump)
 	binlog.RegisterPumpServer(s.serv, s.pump)
-	go s.serv.Serve(l)
+	go func() {
+		err := s.serv.Serve(l)
+		c.Assert(err, IsNil)
+	}()
 	opt := grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
 		return net.DialTimeout("unix", addr, timeout)
 	})
@@ -122,11 +130,16 @@ func (s *testBinlogSuite) SetUpSuite(c *C) {
 }
 
 func (s *testBinlogSuite) TearDownSuite(c *C) {
-	s.ddl.Stop()
+	err := s.ddl.Stop()
+	c.Assert(err, IsNil)
 	s.serv.Stop()
-	os.Remove(s.unixFile)
+	err = os.Remove(s.unixFile)
+	if err != nil {
+		c.Assert(err, ErrorMatches, fmt.Sprintf("remove %v: no such file or directory", s.unixFile))
+	}
 	s.domain.Close()
-	s.store.Close()
+	err = s.store.Close()
+	c.Assert(err, IsNil)
 }
 
 func (s *testBinlogSuite) TestBinlog(c *C) {
@@ -136,7 +149,7 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	pump := s.pump
 	tk.MustExec("drop table if exists local_binlog")
 	ddlQuery := "create table local_binlog (id int unique key, name varchar(10)) shard_row_id_bits=1"
-	binlogDDLQuery := "create table local_binlog (id int unique key, name varchar(10)) /*!90000 shard_row_id_bits=1 */"
+	binlogDDLQuery := "create table local_binlog (id int unique key, name varchar(10)) /*T! shard_row_id_bits=1 */"
 	tk.MustExec(ddlQuery)
 	var matched bool // got matched pre DDL and commit DDL
 	for i := 0; i < 10; i++ {
@@ -187,6 +200,7 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	c.Assert(gotRows, DeepEquals, expected)
 
 	// Test table primary key is not integer.
+	tk.Se.GetSessionVars().EnableClusteredIndex = variable.ClusteredIndexDefModeIntOnly
 	tk.MustExec("create table local_binlog2 (name varchar(64) primary key, age int)")
 	tk.MustExec("insert local_binlog2 values ('abc', 16), ('def', 18)")
 	tk.MustExec("delete from local_binlog2 where name = 'def'")
@@ -288,7 +302,8 @@ func getLatestBinlogPrewriteValue(c *C, pump *mockBinlogPump) *binlog.PrewriteVa
 	for i := len(pump.mu.payloads) - 1; i >= 0; i-- {
 		payload := pump.mu.payloads[i]
 		bin = new(binlog.Binlog)
-		bin.Unmarshal(payload)
+		err := bin.Unmarshal(payload)
+		c.Assert(err, IsNil)
 		if bin.Tp == binlog.BinlogType_Prewrite {
 			break
 		}
@@ -296,7 +311,8 @@ func getLatestBinlogPrewriteValue(c *C, pump *mockBinlogPump) *binlog.PrewriteVa
 	pump.mu.Unlock()
 	c.Assert(bin, NotNil)
 	preVal := new(binlog.PrewriteValue)
-	preVal.Unmarshal(bin.PrewriteValue)
+	err := preVal.Unmarshal(bin.PrewriteValue)
+	c.Assert(err, IsNil)
 	return preVal
 }
 
@@ -305,7 +321,8 @@ func getLatestDDLBinlog(c *C, pump *mockBinlogPump, ddlQuery string) (preDDL, co
 	for i := len(pump.mu.payloads) - 1; i >= 0; i-- {
 		payload := pump.mu.payloads[i]
 		bin := new(binlog.Binlog)
-		bin.Unmarshal(payload)
+		err := bin.Unmarshal(payload)
+		c.Assert(err, IsNil)
 		if bin.Tp == binlog.BinlogType_Commit && bin.DdlJobId > 0 {
 			commitDDL = bin
 		}
@@ -334,7 +351,8 @@ func checkBinlogCount(c *C, pump *mockBinlogPump) {
 	for i := length - 1; i >= 0; i-- {
 		payload := pump.mu.payloads[i]
 		bin = new(binlog.Binlog)
-		bin.Unmarshal(payload)
+		err := bin.Unmarshal(payload)
+		c.Assert(err, IsNil)
 		if bin.Tp == binlog.BinlogType_Prewrite {
 			if bin.DdlJobId != 0 {
 				ddlCount++
@@ -379,9 +397,9 @@ func mutationRowsToRows(c *C, mutationRows [][]byte, columnValueOffsets ...int) 
 }
 
 func (s *testBinlogSuite) TestBinlogForSequence(c *C) {
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/mockSyncBinlogCommit", `return(true)`), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/driver/txn/mockSyncBinlogCommit", `return(true)`), IsNil)
 	defer func() {
-		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/mockSyncBinlogCommit"), IsNil)
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/driver/txn/mockSyncBinlogCommit"), IsNil)
 	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
@@ -503,6 +521,19 @@ func (s *testBinlogSuite) TestPartitionedTable(c *C) {
 	}
 }
 
+func (s *testBinlogSuite) TestPessimisticLockThenCommit(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.Se.GetSessionVars().BinlogClient = s.client
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int, b int)")
+	tk.MustExec("begin pessimistic")
+	tk.MustExec("insert into t select 1, 1")
+	tk.MustExec("commit")
+	prewriteVal := getLatestBinlogPrewriteValue(c, s.pump)
+	c.Assert(len(prewriteVal.Mutations), Equals, 1)
+}
+
 func (s *testBinlogSuite) TestDeleteSchema(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
@@ -524,40 +555,116 @@ func (s *testBinlogSuite) TestAddSpecialComment(c *C) {
 	}{
 		{
 			"create table t1 (id int ) shard_row_id_bits=2;",
-			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 */ ;",
+			"create table t1 (id int ) /*T! shard_row_id_bits=2 */ ;",
 		},
 		{
 			"create table t1 (id int ) shard_row_id_bits=2 pre_split_regions=2;",
-			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ ;",
+			"create table t1 (id int ) /*T! shard_row_id_bits=2 pre_split_regions=2 */ ;",
 		},
 		{
 			"create table t1 (id int ) shard_row_id_bits=2     pre_split_regions=2;",
-			"create table t1 (id int ) /*!90000 shard_row_id_bits=2     pre_split_regions=2 */ ;",
+			"create table t1 (id int ) /*T! shard_row_id_bits=2     pre_split_regions=2 */ ;",
 		},
 
 		{
 			"create table t1 (id int ) shard_row_id_bits=2 engine=innodb pre_split_regions=2;",
-			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ engine=innodb ;",
+			"create table t1 (id int ) /*T! shard_row_id_bits=2 pre_split_regions=2 */ engine=innodb ;",
 		},
 		{
 			"create table t1 (id int ) pre_split_regions=2 shard_row_id_bits=2;",
-			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ ;",
+			"create table t1 (id int ) /*T! shard_row_id_bits=2 pre_split_regions=2 */ ;",
 		},
 		{
 			"create table t6 (id int ) shard_row_id_bits=2 shard_row_id_bits=3 pre_split_regions=2;",
-			"create table t6 (id int ) /*!90000 shard_row_id_bits=2 shard_row_id_bits=3 pre_split_regions=2 */ ;",
+			"create table t6 (id int ) /*T! shard_row_id_bits=2 shard_row_id_bits=3 pre_split_regions=2 */ ;",
 		},
 		{
 			"create table t1 (id int primary key auto_random(2));",
-			"create table t1 (id int primary key /*T!30100 auto_random(2) */ );",
+			"create table t1 (id int primary key /*T![auto_rand] auto_random(2) */ );",
+		},
+		{
+			"create table t1 (id int primary key auto_random);",
+			"create table t1 (id int primary key /*T![auto_rand] auto_random */ );",
 		},
 		{
 			"create table t1 (id int auto_random ( 4 ) primary key);",
-			"create table t1 (id int /*T!30100 auto_random ( 4 ) */ primary key);",
+			"create table t1 (id int /*T![auto_rand] auto_random ( 4 ) */ primary key);",
 		},
 		{
 			"create table t1 (id int  auto_random  (   4    ) primary key);",
-			"create table t1 (id int  /*T!30100 auto_random  (   4    ) */ primary key);",
+			"create table t1 (id int  /*T![auto_rand] auto_random  (   4    ) */ primary key);",
+		},
+		{
+			"create table t1 (id int auto_random ( 3 ) primary key) auto_random_base = 100;",
+			"create table t1 (id int /*T![auto_rand] auto_random ( 3 ) */ primary key) /*T![auto_rand_base] auto_random_base = 100 */ ;",
+		},
+		{
+			"create table t1 (id int auto_random primary key) auto_random_base = 50;",
+			"create table t1 (id int /*T![auto_rand] auto_random */ primary key) /*T![auto_rand_base] auto_random_base = 50 */ ;",
+		},
+		{
+			"create table t1 (id int auto_increment key) auto_id_cache 100;",
+			"create table t1 (id int auto_increment key) /*T![auto_id_cache] auto_id_cache 100 */ ;",
+		},
+		{
+			"create table t1 (id int auto_increment unique) auto_id_cache 10;",
+			"create table t1 (id int auto_increment unique) /*T![auto_id_cache] auto_id_cache 10 */ ;",
+		},
+		{
+			"create table t1 (id int) auto_id_cache = 5;",
+			"create table t1 (id int) /*T![auto_id_cache] auto_id_cache = 5 */ ;",
+		},
+		{
+			"create table t1 (id int) auto_id_cache=5;",
+			"create table t1 (id int) /*T![auto_id_cache] auto_id_cache=5 */ ;",
+		},
+		{
+			"create table t1 (id int) /*T![auto_id_cache] auto_id_cache=5 */ ;",
+			"create table t1 (id int) /*T![auto_id_cache] auto_id_cache=5 */ ;",
+		},
+		{
+			"create table t1 (id int, a varchar(255), primary key (a, b) clustered);",
+			"create table t1 (id int, a varchar(255), primary key (a, b) /*T![clustered_index] clustered */ );",
+		},
+		{
+			"create table t1(id int, v int, primary key(a) clustered);",
+			"create table t1(id int, v int, primary key(a) /*T![clustered_index] clustered */ );",
+		},
+		{
+			"create table t1(id int primary key clustered, v int);",
+			"create table t1(id int primary key /*T![clustered_index] clustered */ , v int);",
+		},
+		{
+			"alter table t add primary key(a) clustered;",
+			"alter table t add primary key(a) /*T![clustered_index] clustered */ ;",
+		},
+		{
+			"create table t1 (id int, a varchar(255), primary key (a, b) nonclustered);",
+			"create table t1 (id int, a varchar(255), primary key (a, b) /*T![clustered_index] nonclustered */ );",
+		},
+		{
+			"create table t1 (id int, a varchar(255), primary key (a, b) /*T![clustered_index] nonclustered */);",
+			"create table t1 (id int, a varchar(255), primary key (a, b) /*T![clustered_index] nonclustered */);",
+		},
+		{
+			"create table clustered_test(id int)",
+			"create table clustered_test(id int)",
+		},
+		{
+			"create database clustered_test",
+			"create database clustered_test",
+		},
+		{
+			"create database clustered",
+			"create database clustered",
+		},
+		{
+			"create table clustered (id int)",
+			"create table clustered (id int)",
+		},
+		{
+			"create table t1 (id int, a varchar(255) key clustered);",
+			"create table t1 (id int, a varchar(255) key /*T![clustered_index] clustered */ );",
 		},
 	}
 	for _, ca := range testCase {
@@ -590,4 +697,38 @@ func testGetTableByName(c *C, ctx sessionctx.Context, db, table string) table.Ta
 	tbl, err := dom.InfoSchema().TableByName(model.NewCIStr(db), model.NewCIStr(table))
 	c.Assert(err, IsNil)
 	return tbl
+}
+
+func (s *testBinlogSuite) TestTempTableBinlog(c *C) {
+	tk := testkit.NewTestKitWithInit(c, s.store)
+	tk.Se.GetSessionVars().BinlogClient = s.client
+	tk.MustExec("begin")
+	tk.MustExec("set tidb_enable_global_temporary_table=true")
+	tk.MustExec("drop table if exists temp_table")
+	ddlQuery := "create global temporary table temp_table(id int) on commit delete rows"
+	tk.MustExec(ddlQuery)
+	ok := mustGetDDLBinlog(s, ddlQuery, c)
+	c.Assert(ok, IsTrue)
+
+	tk.MustExec("insert temp_table value(1)")
+	tk.MustExec("update temp_table set id=id+1")
+	tk.MustExec("commit")
+	prewriteVal := getLatestBinlogPrewriteValue(c, s.pump)
+	c.Assert(len(prewriteVal.Mutations), Equals, 0)
+
+	tk.MustExec("begin")
+	tk.MustExec("delete from temp_table")
+	tk.MustExec("commit")
+	prewriteVal = getLatestBinlogPrewriteValue(c, s.pump)
+	c.Assert(len(prewriteVal.Mutations), Equals, 0)
+
+	ddlQuery = "truncate table temp_table"
+	tk.MustExec(ddlQuery)
+	ok = mustGetDDLBinlog(s, ddlQuery, c)
+	c.Assert(ok, IsTrue)
+
+	ddlQuery = "drop table if exists temp_table"
+	tk.MustExec(ddlQuery)
+	ok = mustGetDDLBinlog(s, ddlQuery, c)
+	c.Assert(ok, IsTrue)
 }

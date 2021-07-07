@@ -31,12 +31,11 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"flag"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"net/http"
-	"unsafe"
 
 	// For pprof
 	_ "net/http/pprof"
@@ -45,6 +44,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/blacktear23/go-proxyprotocol"
 	"github.com/pingcap/errors"
@@ -53,10 +53,13 @@ import (
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/plugin"
+	"github.com/pingcap/tidb/session/txninfo"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/fastrand"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/sys/linux"
@@ -66,10 +69,10 @@ import (
 )
 
 var (
-	baseConnID uint32
-	serverPID  int
-	osUser     string
-	osVersion  string
+	serverPID   int
+	osUser      string
+	osVersion   string
+	runInGoTest bool
 )
 
 func init() {
@@ -84,16 +87,19 @@ func init() {
 	if err != nil {
 		osVersion = ""
 	}
+	runInGoTest = flag.Lookup("test.v") != nil || flag.Lookup("check.v") != nil
 }
 
 var (
-	errUnknownFieldType        = terror.ClassServer.New(errno.ErrUnknownFieldType, errno.MySQLErrName[errno.ErrUnknownFieldType])
-	errInvalidSequence         = terror.ClassServer.New(errno.ErrInvalidSequence, errno.MySQLErrName[errno.ErrInvalidSequence])
-	errInvalidType             = terror.ClassServer.New(errno.ErrInvalidType, errno.MySQLErrName[errno.ErrInvalidType])
-	errNotAllowedCommand       = terror.ClassServer.New(errno.ErrNotAllowedCommand, errno.MySQLErrName[errno.ErrNotAllowedCommand])
-	errAccessDenied            = terror.ClassServer.New(errno.ErrAccessDenied, errno.MySQLErrName[errno.ErrAccessDenied])
-	errConCount                = terror.ClassServer.New(errno.ErrConCount, errno.MySQLErrName[errno.ErrConCount])
-	errSecureTransportRequired = terror.ClassServer.New(errno.ErrSecureTransportRequired, errno.MySQLErrName[errno.ErrSecureTransportRequired])
+	errUnknownFieldType        = dbterror.ClassServer.NewStd(errno.ErrUnknownFieldType)
+	errInvalidSequence         = dbterror.ClassServer.NewStd(errno.ErrInvalidSequence)
+	errInvalidType             = dbterror.ClassServer.NewStd(errno.ErrInvalidType)
+	errNotAllowedCommand       = dbterror.ClassServer.NewStd(errno.ErrNotAllowedCommand)
+	errAccessDenied            = dbterror.ClassServer.NewStd(errno.ErrAccessDenied)
+	errConCount                = dbterror.ClassServer.NewStd(errno.ErrConCount)
+	errSecureTransportRequired = dbterror.ClassServer.NewStd(errno.ErrSecureTransportRequired)
+	errMultiStatementDisabled  = dbterror.ClassServer.NewStd(errno.ErrMultiStatementDisabled)
+	errNewAbortingConnection   = dbterror.ClassServer.NewStd(errno.ErrNewAbortingConnection)
 )
 
 // DefaultCapability is the capability of the server when it is created using the default configuration.
@@ -113,14 +119,16 @@ type Server struct {
 	socket            net.Listener
 	rwlock            sync.RWMutex
 	concurrentLimiter *TokenLimiter
-	clients           map[uint32]*clientConn
+	clients           map[uint64]*clientConn
 	capability        uint32
 	dom               *domain.Domain
+	globalConnID      util.GlobalConnID
 
 	statusAddr     string
 	statusListener net.Listener
 	statusServer   *http.Server
 	grpcServer     *grpc.Server
+	inShutdownMode bool
 }
 
 // ConnectionCount gets current connection count.
@@ -134,6 +142,7 @@ func (s *Server) ConnectionCount() int {
 func (s *Server) getToken() *Token {
 	start := time.Now()
 	tok := s.concurrentLimiter.Get()
+	metrics.TokenGauge.Inc()
 	// Note that data smaller than one microsecond is ignored, because that case can be viewed as non-block.
 	metrics.GetTokenDurationHistogram.Observe(float64(time.Since(start).Nanoseconds() / 1e3))
 	return tok
@@ -141,6 +150,7 @@ func (s *Server) getToken() *Token {
 
 func (s *Server) releaseToken(token *Token) {
 	s.concurrentLimiter.Put(token)
+	metrics.TokenGauge.Dec()
 }
 
 // SetDomain use to set the server domain.
@@ -148,57 +158,29 @@ func (s *Server) SetDomain(dom *domain.Domain) {
 	s.dom = dom
 }
 
+// InitGlobalConnID initialize global connection id.
+func (s *Server) InitGlobalConnID(serverIDGetter func() uint64) {
+	s.globalConnID = util.GlobalConnID{
+		ServerIDGetter: serverIDGetter,
+		Is64bits:       true,
+	}
+}
+
 // newConn creates a new *clientConn from a net.Conn.
 // It allocates a connection ID and random salt data for authentication.
 func (s *Server) newConn(conn net.Conn) *clientConn {
 	cc := newClientConn(s)
-	if s.cfg.Performance.TCPKeepAlive {
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			if err := tcpConn.SetKeepAlive(true); err != nil {
-				logutil.BgLogger().Error("failed to set tcp keep alive option", zap.Error(err))
-			}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(s.cfg.Performance.TCPKeepAlive); err != nil {
+			logutil.BgLogger().Error("failed to set tcp keep alive option", zap.Error(err))
+		}
+		if err := tcpConn.SetNoDelay(s.cfg.Performance.TCPNoDelay); err != nil {
+			logutil.BgLogger().Error("failed to set tcp no delay option", zap.Error(err))
 		}
 	}
 	cc.setConn(conn)
 	cc.salt = fastrand.Buf(20)
 	return cc
-}
-
-func (s *Server) isUnixSocket() bool {
-	return s.cfg.Socket != ""
-}
-
-func (s *Server) forwardUnixSocketToTCP() {
-	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-	for {
-		if s.listener == nil {
-			return // server shutdown has started
-		}
-		if uconn, err := s.socket.Accept(); err == nil {
-			logutil.BgLogger().Info("server socket forwarding", zap.String("from", s.cfg.Socket), zap.String("to", addr))
-			go s.handleForwardedConnection(uconn, addr)
-		} else {
-			if s.listener != nil {
-				logutil.BgLogger().Error("server failed to forward", zap.String("from", s.cfg.Socket), zap.String("to", addr), zap.Error(err))
-			}
-		}
-	}
-}
-
-func (s *Server) handleForwardedConnection(uconn net.Conn, addr string) {
-	defer terror.Call(uconn.Close)
-	if tconn, err := net.Dial("tcp", addr); err == nil {
-		go func() {
-			if _, err := io.Copy(uconn, tconn); err != nil {
-				logutil.BgLogger().Warn("copy server to socket failed", zap.Error(err))
-			}
-		}()
-		if _, err := io.Copy(tconn, uconn); err != nil {
-			logutil.BgLogger().Warn("socket forward copy failed", zap.Error(err))
-		}
-	} else {
-		logutil.BgLogger().Warn("socket forward failed: could not connect", zap.String("addr", addr), zap.Error(err))
-	}
 }
 
 // NewServer creates a new Server.
@@ -207,9 +189,10 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 		cfg:               cfg,
 		driver:            driver,
 		concurrentLimiter: NewTokenLimiter(cfg.TokenLimit),
-		clients:           make(map[uint32]*clientConn),
+		clients:           make(map[uint64]*clientConn),
+		globalConnID:      util.GlobalConnID{ServerID: 0, Is64bits: true},
 	}
-
+	setTxnScope()
 	tlsConfig, err := util.LoadTLSCertificates(s.cfg.Security.SSLCA, s.cfg.Security.SSLKey, s.cfg.Security.SSLCert)
 	if err != nil {
 		logutil.BgLogger().Error("secure connection cert/key/ca load fail", zap.Error(err))
@@ -217,7 +200,7 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 	if tlsConfig != nil {
 		setSSLVariable(s.cfg.Security.SSLCA, s.cfg.Security.SSLKey, s.cfg.Security.SSLCert)
 		atomic.StorePointer(&s.tlsConfig, unsafe.Pointer(tlsConfig))
-		logutil.BgLogger().Info("mysql protocol server secure connection is enabled", zap.Bool("client verification enabled", len(variable.SysVars["ssl_ca"].Value) > 0))
+		logutil.BgLogger().Info("mysql protocol server secure connection is enabled", zap.Bool("client verification enabled", len(variable.GetSysVar("ssl_ca").Value) > 0))
 	} else if cfg.Security.RequireSecureTransport {
 		return nil, errSecureTransportRequired.FastGenByArgs()
 	}
@@ -229,41 +212,58 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 		s.capability |= mysql.ClientSSL
 	}
 
-	if s.cfg.Host != "" && s.cfg.Port != 0 {
+	if s.cfg.Host != "" && (s.cfg.Port != 0 || runInGoTest) {
 		addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-		if s.listener, err = net.Listen("tcp", addr); err == nil {
-			logutil.BgLogger().Info("server is running MySQL protocol", zap.String("addr", addr))
-			if cfg.Socket != "" {
-				if s.socket, err = net.Listen("unix", s.cfg.Socket); err == nil {
-					logutil.BgLogger().Info("server redirecting", zap.String("from", s.cfg.Socket), zap.String("to", addr))
-					go s.forwardUnixSocketToTCP()
-				}
-			}
+		tcpProto := "tcp"
+		if s.cfg.EnableTCP4Only {
+			tcpProto = "tcp4"
 		}
-	} else if cfg.Socket != "" {
-		if s.listener, err = net.Listen("unix", cfg.Socket); err == nil {
-			logutil.BgLogger().Info("server is running MySQL protocol", zap.String("socket", cfg.Socket))
+		if s.listener, err = net.Listen(tcpProto, addr); err != nil {
+			return nil, errors.Trace(err)
 		}
-	} else {
+		logutil.BgLogger().Info("server is running MySQL protocol", zap.String("addr", addr))
+		if runInGoTest && s.cfg.Port == 0 {
+			s.cfg.Port = uint(s.listener.Addr().(*net.TCPAddr).Port)
+		}
+	}
+
+	if s.cfg.Socket != "" {
+		if s.socket, err = net.Listen("unix", s.cfg.Socket); err != nil {
+			return nil, errors.Trace(err)
+		}
+		logutil.BgLogger().Info("server is running MySQL protocol", zap.String("socket", s.cfg.Socket))
+	}
+
+	if s.socket == nil && s.listener == nil {
 		err = errors.New("Server not configured to listen on either -socket or -host and -port")
-	}
-
-	if cfg.ProxyProtocol.Networks != "" {
-		pplistener, errProxy := proxyprotocol.NewListener(s.listener, cfg.ProxyProtocol.Networks,
-			int(cfg.ProxyProtocol.HeaderTimeout))
-		if errProxy != nil {
-			logutil.BgLogger().Error("ProxyProtocol networks parameter invalid")
-			return nil, errors.Trace(errProxy)
-		}
-		logutil.BgLogger().Info("server is running MySQL protocol (through PROXY protocol)", zap.String("host", s.cfg.Host))
-		s.listener = pplistener
-	}
-
-	if s.cfg.Status.ReportStatus && err == nil {
-		err = s.listenStatusHTTPServer()
-	}
-	if err != nil {
 		return nil, errors.Trace(err)
+	}
+
+	if s.cfg.ProxyProtocol.Networks != "" {
+		proxyTarget := s.listener
+		if proxyTarget == nil {
+			proxyTarget = s.socket
+		}
+		pplistener, err := proxyprotocol.NewListener(proxyTarget, s.cfg.ProxyProtocol.Networks,
+			int(s.cfg.ProxyProtocol.HeaderTimeout))
+		if err != nil {
+			logutil.BgLogger().Error("ProxyProtocol networks parameter invalid")
+			return nil, errors.Trace(err)
+		}
+		if s.listener != nil {
+			s.listener = pplistener
+			logutil.BgLogger().Info("server is running MySQL protocol (through PROXY protocol)", zap.String("host", s.cfg.Host))
+		} else {
+			s.socket = pplistener
+			logutil.BgLogger().Info("server is running MySQL protocol (through PROXY protocol)", zap.String("socket", s.cfg.Socket))
+		}
+	}
+
+	if s.cfg.Status.ReportStatus {
+		err = s.listenStatusHTTPServer()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
 	}
 
 	// Init rand seed for randomBuf()
@@ -272,27 +272,69 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 }
 
 func setSSLVariable(ca, key, cert string) {
-	variable.SysVars["have_openssl"].Value = "YES"
-	variable.SysVars["have_ssl"].Value = "YES"
-	variable.SysVars["ssl_cert"].Value = cert
-	variable.SysVars["ssl_key"].Value = key
-	variable.SysVars["ssl_ca"].Value = ca
+	variable.SetSysVar("have_openssl", "YES")
+	variable.SetSysVar("have_ssl", "YES")
+	variable.SetSysVar("ssl_cert", cert)
+	variable.SetSysVar("ssl_key", key)
+	variable.SetSysVar("ssl_ca", ca)
+}
+
+func setTxnScope() {
+	variable.SetSysVar(variable.TiDBTxnScope, func() string {
+		if !variable.EnableLocalTxn.Load() {
+			return kv.GlobalTxnScope
+		}
+		if txnScope := config.GetTxnScopeFromConfig(); txnScope == kv.GlobalTxnScope {
+			return kv.GlobalTxnScope
+		}
+		return kv.LocalTxnScope
+	}())
+}
+
+// Export config-related metrics
+func (s *Server) reportConfig() {
+	metrics.ConfigStatus.WithLabelValues("token-limit").Set(float64(s.cfg.TokenLimit))
+	metrics.ConfigStatus.WithLabelValues("mem-quota-query").Set(float64(s.cfg.MemQuotaQuery))
+	metrics.ConfigStatus.WithLabelValues("max-server-connections").Set(float64(s.cfg.MaxServerConnections))
 }
 
 // Run runs the server.
 func (s *Server) Run() error {
 	metrics.ServerEventCounter.WithLabelValues(metrics.EventStart).Inc()
+	s.reportConfig()
 
 	// Start HTTP API to report tidb info such as TPS.
 	if s.cfg.Status.ReportStatus {
 		s.startStatusHTTP()
 	}
+	// If error should be reported and exit the server it can be sent on this
+	// channel. Otherwise end with sending a nil error to signal "done"
+	errChan := make(chan error)
+	go s.startNetworkListener(s.listener, false, errChan)
+	go s.startNetworkListener(s.socket, true, errChan)
+	err := <-errChan
+	if err != nil {
+		return err
+	}
+	return <-errChan
+}
+
+func (s *Server) startNetworkListener(listener net.Listener, isUnixSocket bool, errChan chan error) {
+	if listener == nil {
+		errChan <- nil
+		return
+	}
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			if opErr, ok := err.(*net.OpError); ok {
 				if opErr.Err.Error() == "use of closed network connection" {
-					return nil
+					if s.inShutdownMode {
+						errChan <- nil
+					} else {
+						errChan <- err
+					}
+					return
 				}
 			}
 
@@ -303,15 +345,19 @@ func (s *Server) Run() error {
 			}
 
 			logutil.BgLogger().Error("accept failed", zap.Error(err))
-			return errors.Trace(err)
+			errChan <- err
+			return
 		}
 
 		clientConn := s.newConn(conn)
+		if isUnixSocket {
+			clientConn.isUnixSocket = true
+		}
 
 		err = plugin.ForeachPlugin(plugin.Audit, func(p *plugin.Plugin) error {
 			authPlugin := plugin.DeclareAuditManifest(p.Manifest)
 			if authPlugin.OnConnectionEvent != nil {
-				host, err := clientConn.PeerHost("")
+				host, _, err := clientConn.PeerHost("")
 				if err != nil {
 					logutil.BgLogger().Error("get peer host failed", zap.Error(err))
 					terror.Log(clientConn.Close())
@@ -330,13 +376,34 @@ func (s *Server) Run() error {
 			continue
 		}
 
+		if s.dom != nil && s.dom.IsLostConnectionToPD() {
+			logutil.BgLogger().Warn("reject connection due to lost connection to PD")
+			terror.Log(clientConn.Close())
+			continue
+		}
+
 		go s.onConn(clientConn)
+	}
+}
+
+func (s *Server) startShutdown() {
+	s.rwlock.RLock()
+	logutil.BgLogger().Info("setting tidb-server to report unhealthy (shutting-down)")
+	s.inShutdownMode = true
+	s.rwlock.RUnlock()
+	// give the load balancer a chance to receive a few unhealthy health reports
+	// before acquiring the s.rwlock and blocking connections.
+	waitTime := time.Duration(s.cfg.GracefulWaitBeforeShutdown) * time.Second
+	if waitTime > 0 {
+		logutil.BgLogger().Info("waiting for stray connections before starting shutdown process", zap.Duration("waitTime", waitTime))
+		time.Sleep(waitTime)
 	}
 }
 
 // Close closes the server.
 func (s *Server) Close() {
-	s.rwlock.Lock()
+	s.startShutdown()
+	s.rwlock.Lock() // prevent new connections
 	defer s.rwlock.Unlock()
 
 	if s.listener != nil {
@@ -365,19 +432,18 @@ func (s *Server) Close() {
 func (s *Server) onConn(conn *clientConn) {
 	ctx := logutil.WithConnID(context.Background(), conn.connectionID)
 	if err := conn.handshake(ctx); err != nil {
-		terror.Log(err)
-		if plugin.IsEnable(plugin.Audit) {
+		if plugin.IsEnable(plugin.Audit) && conn.ctx != nil {
 			conn.ctx.GetSessionVars().ConnectionInfo = conn.connectInfo()
+			err = plugin.ForeachPlugin(plugin.Audit, func(p *plugin.Plugin) error {
+				authPlugin := plugin.DeclareAuditManifest(p.Manifest)
+				if authPlugin.OnConnectionEvent != nil {
+					pluginCtx := context.WithValue(context.Background(), plugin.RejectReasonCtxValue{}, err.Error())
+					return authPlugin.OnConnectionEvent(pluginCtx, plugin.Reject, conn.ctx.GetSessionVars().ConnectionInfo)
+				}
+				return nil
+			})
+			terror.Log(err)
 		}
-		err = plugin.ForeachPlugin(plugin.Audit, func(p *plugin.Plugin) error {
-			authPlugin := plugin.DeclareAuditManifest(p.Manifest)
-			if authPlugin.OnConnectionEvent != nil {
-				pluginCtx := context.WithValue(context.Background(), plugin.RejectReasonCtxValue{}, err.Error())
-				return authPlugin.OnConnectionEvent(pluginCtx, plugin.Reject, conn.ctx.GetSessionVars().ConnectionInfo)
-			}
-			return nil
-		})
-		terror.Log(err)
 		// Some keep alive services will send request to TiDB and disconnect immediately.
 		// So we only record metrics.
 		metrics.HandShakeErrorCounter.Inc()
@@ -386,10 +452,10 @@ func (s *Server) onConn(conn *clientConn) {
 		return
 	}
 
-	logutil.Logger(ctx).Info("new connection", zap.String("remoteAddr", conn.bufReadConn.RemoteAddr().String()))
+	logutil.Logger(ctx).Debug("new connection", zap.String("remoteAddr", conn.bufReadConn.RemoteAddr().String()))
 
 	defer func() {
-		logutil.Logger(ctx).Info("connection closed")
+		logutil.Logger(ctx).Debug("connection closed")
 	}()
 	s.rwlock.Lock()
 	s.clients[conn.connectionID] = conn
@@ -416,6 +482,10 @@ func (s *Server) onConn(conn *clientConn) {
 	conn.Run(ctx)
 
 	err = plugin.ForeachPlugin(plugin.Audit, func(p *plugin.Plugin) error {
+		// Audit plugin may be disabled before a conn is created, leading no connectionInfo in sessionVars.
+		if sessionVars.ConnectionInfo == nil {
+			sessionVars.ConnectionInfo = conn.connectInfo()
+		}
 		authPlugin := plugin.DeclareAuditManifest(p.Manifest)
 		if authPlugin.OnConnectionEvent != nil {
 			sessionVars.ConnectionInfo.Duration = float64(time.Since(connectedTime)) / float64(time.Millisecond)
@@ -433,7 +503,7 @@ func (s *Server) onConn(conn *clientConn) {
 
 func (cc *clientConn) connectInfo() *variable.ConnectionInfo {
 	connType := "Socket"
-	if cc.server.isUnixSocket() {
+	if cc.isUnixSocket {
 		connType = "UnixSocket"
 	} else if cc.tlsConn != nil {
 		connType = "SSL/TLS"
@@ -458,6 +528,11 @@ func (cc *clientConn) connectInfo() *variable.ConnectionInfo {
 }
 
 func (s *Server) checkConnectionCount() error {
+	// When the value of MaxServerConnections is 0, the number of connections is unlimited.
+	if int(s.cfg.MaxServerConnections) == 0 {
+		return nil
+	}
+
 	s.rwlock.RLock()
 	conns := len(s.clients)
 	s.rwlock.RUnlock()
@@ -476,11 +551,24 @@ func (s *Server) ShowProcessList() map[uint64]*util.ProcessInfo {
 	defer s.rwlock.RUnlock()
 	rs := make(map[uint64]*util.ProcessInfo, len(s.clients))
 	for _, client := range s.clients {
-		if atomic.LoadInt32(&client.status) == connStatusWaitShutdown {
-			continue
-		}
 		if pi := client.ctx.ShowProcess(); pi != nil {
 			rs[pi.ID] = pi
+		}
+	}
+	return rs
+}
+
+// ShowTxnList shows all txn info for displaying in `TIDB_TRX`
+func (s *Server) ShowTxnList() []*txninfo.TxnInfo {
+	s.rwlock.RLock()
+	defer s.rwlock.RUnlock()
+	rs := make([]*txninfo.TxnInfo, 0, len(s.clients))
+	for _, client := range s.clients {
+		if client.ctx.Session != nil {
+			info := client.ctx.Session.TxnInfo()
+			if info != nil {
+				rs = append(rs, info)
+			}
 		}
 	}
 	return rs
@@ -489,9 +577,9 @@ func (s *Server) ShowProcessList() map[uint64]*util.ProcessInfo {
 // GetProcessInfo implements the SessionManager interface.
 func (s *Server) GetProcessInfo(id uint64) (*util.ProcessInfo, bool) {
 	s.rwlock.RLock()
-	conn, ok := s.clients[uint32(id)]
+	conn, ok := s.clients[id]
 	s.rwlock.RUnlock()
-	if !ok || atomic.LoadInt32(&conn.status) == connStatusWaitShutdown {
+	if !ok {
 		return &util.ProcessInfo{}, false
 	}
 	return conn.ctx.ShowProcess(), ok
@@ -504,13 +592,13 @@ func (s *Server) Kill(connectionID uint64, query bool) {
 
 	s.rwlock.RLock()
 	defer s.rwlock.RUnlock()
-	conn, ok := s.clients[uint32(connectionID)]
+	conn, ok := s.clients[connectionID]
 	if !ok {
 		return
 	}
 
 	if !query {
-		// Mark the client connection status as WaitShutdown, when the goroutine detect
+		// Mark the client connection status as WaitShutdown, when clientConn.Run detect
 		// this, it will end the dispatch loop and exit.
 		atomic.StoreInt32(&conn.status, connStatusWaitShutdown)
 	}
@@ -528,7 +616,13 @@ func (s *Server) getTLSConfig() *tls.Config {
 
 func killConn(conn *clientConn) {
 	sessVars := conn.ctx.GetSessionVars()
-	atomic.CompareAndSwapUint32(&sessVars.Killed, 0, 1)
+	atomic.StoreUint32(&sessVars.Killed, 1)
+	conn.mu.RLock()
+	cancelFunc := conn.mu.cancelFunc
+	conn.mu.RUnlock()
+	if cancelFunc != nil {
+		cancelFunc()
+	}
 }
 
 // KillAllConnections kills all connections when server is not gracefully shutdown.
@@ -610,6 +704,11 @@ func (s *Server) kickIdleConnection() {
 	}
 }
 
+// ServerID implements SessionManager interface.
+func (s *Server) ServerID() uint64 {
+	return s.dom.ServerID()
+}
+
 // setSysTimeZoneOnce is used for parallel run tests. When several servers are running,
 // only the first will actually do setSystemTimeZoneVariable, thus we can avoid data race.
 var setSysTimeZoneOnce = &sync.Once{}
@@ -621,16 +720,9 @@ func setSystemTimeZoneVariable() {
 			logutil.BgLogger().Error(
 				"Error getting SystemTZ, use default value instead",
 				zap.Error(err),
-				zap.String("default system_time_zone", variable.SysVars["system_time_zone"].Value))
+				zap.String("default system_time_zone", variable.GetSysVar("system_time_zone").Value))
 			return
 		}
-		variable.SysVars["system_time_zone"].Value = tz
+		variable.SetSysVar("system_time_zone", tz)
 	})
 }
-
-// Server error codes.
-const (
-	codeUnknownFieldType = 1
-	codeInvalidSequence  = 3
-	codeInvalidType      = 4
-)

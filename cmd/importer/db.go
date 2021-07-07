@@ -277,7 +277,7 @@ func genColumnData(table *table, column *column) (string, error) {
 
 		data = append(data, '\'')
 		return string(data), nil
-	case mysql.TypeNewDecimal, mysql.TypeDecimal:
+	case mysql.TypeNewDecimal:
 		var limit = int64(math.Pow10(tp.Flen))
 		var intVal int64
 		if limit < 0 {
@@ -303,7 +303,7 @@ func genColumnData(table *table, column *column) (string, error) {
 }
 
 func execSQL(db *sql.DB, sql string) error {
-	if len(sql) == 0 {
+	if sql == "" {
 		return nil
 	}
 

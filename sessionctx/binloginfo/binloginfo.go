@@ -14,7 +14,6 @@
 package binloginfo
 
 import (
-	"fmt"
 	"math"
 	"regexp"
 	"strings"
@@ -23,7 +22,6 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb-tools/tidb-binlog/node"
 	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
@@ -31,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/sessionctx"
+	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tipb/go-binlog"
 	"go.uber.org/zap"
@@ -45,9 +44,8 @@ func init() {
 // shared by all sessions.
 var pumpsClient *pumpcli.PumpsClient
 var pumpsClientLock sync.RWMutex
-var shardPat = regexp.MustCompile(`SHARD_ROW_ID_BITS\s*=\s*\d+\s*`)
-var preSplitPat = regexp.MustCompile(`PRE_SPLIT_REGIONS\s*=\s*\d+\s*`)
-var autoRandomPat = regexp.MustCompile(`AUTO_RANDOM\s*\(\s*\d+\s*\)\s*`)
+var shardPat = regexp.MustCompile(`(?P<REPLACE>SHARD_ROW_ID_BITS\s*=\s*\d+\s*)`)
+var preSplitPat = regexp.MustCompile(`(?P<REPLACE>PRE_SPLIT_REGIONS\s*=\s*\d+\s*)`)
 
 // BinlogInfo contains binlog data and binlog client.
 type BinlogInfo struct {
@@ -59,13 +57,13 @@ type BinlogInfo struct {
 type BinlogStatus int
 
 const (
-	//BinlogStatusUnknown stands for unknown binlog status
+	// BinlogStatusUnknown stands for unknown binlog status
 	BinlogStatusUnknown BinlogStatus = iota
-	//BinlogStatusOn stands for the binlog is enabled
+	// BinlogStatusOn stands for the binlog is enabled
 	BinlogStatusOn
-	//BinlogStatusOff stands for the binlog is disabled
+	// BinlogStatusOff stands for the binlog is disabled
 	BinlogStatusOff
-	//BinlogStatusSkipping stands for the binlog status
+	// BinlogStatusSkipping stands for the binlog status
 	BinlogStatusSkipping
 )
 
@@ -102,7 +100,7 @@ func GetPrewriteValue(ctx sessionctx.Context, createIfNotExists bool) *binlog.Pr
 	vars := ctx.GetSessionVars()
 	v, ok := vars.TxnCtx.Binlog.(*binlog.PrewriteValue)
 	if !ok && createIfNotExists {
-		schemaVer := ctx.GetSessionVars().TxnCtx.SchemaVersion
+		schemaVer := ctx.GetInfoSchema().SchemaMetaVersion()
 		v = &binlog.PrewriteValue{SchemaVersion: schemaVer}
 		vars.TxnCtx.Binlog = v
 	}
@@ -156,17 +154,15 @@ func WaitBinlogRecover(timeout time.Duration) error {
 	defer ticker.Stop()
 	start := time.Now()
 	for {
-		select {
-		case <-ticker.C:
-			if atomic.LoadInt32(&skippedCommitterCounter) == 0 {
-				logutil.BgLogger().Warn("[binloginfo] binlog recovered")
-				return nil
-			}
-			if time.Since(start) > timeout {
-				logutil.BgLogger().Warn("[binloginfo] waiting for binlog recovering timed out",
-					zap.Duration("duration", timeout))
-				return errors.New("timeout")
-			}
+		<-ticker.C
+		if atomic.LoadInt32(&skippedCommitterCounter) == 0 {
+			logutil.BgLogger().Warn("[binloginfo] binlog recovered")
+			return nil
+		}
+		if time.Since(start) > timeout {
+			logutil.BgLogger().Warn("[binloginfo] waiting for binlog recovering timed out",
+				zap.Duration("duration", timeout))
+			return errors.New("timeout")
 		}
 	}
 }
@@ -299,28 +295,40 @@ func SetDDLBinlog(client *pumpcli.PumpsClient, txn kv.Transaction, jobID int64, 
 	txn.SetOption(kv.BinlogInfo, info)
 }
 
-const specialPrefix = `/*!90000 `
-const specialVersionPrefix = `/*T!%s `
+const specialPrefix = `/*T! `
 
 // AddSpecialComment uses to add comment for table option in DDL query.
-// Export for testing.
+// Used by pingcap/ticdc.
 func AddSpecialComment(ddlQuery string) string {
-	if strings.Contains(ddlQuery, specialPrefix) || parser.SpecVersionCodePattern.MatchString(ddlQuery) {
+	if strings.Contains(ddlQuery, specialPrefix) || strings.Contains(ddlQuery, driver.SpecialCommentVersionPrefix) {
 		return ddlQuery
 	}
 	ddlQuery = addSpecialCommentByRegexps(ddlQuery, specialPrefix, shardPat, preSplitPat)
-	ddlQuery = addSpecialCommentByRegexps(ddlQuery, fmt.Sprintf(specialVersionPrefix, parser.CommentCodeAutoRandom), autoRandomPat)
+	for featureID, pattern := range driver.FeatureIDPatterns {
+		ddlQuery = addSpecialCommentByRegexps(ddlQuery, driver.BuildSpecialCommentPrefix(featureID), pattern)
+	}
 	return ddlQuery
 }
 
 // addSpecialCommentByRegexps uses to add special comment for the worlds in the ddlQuery with match the regexps.
+// addSpecialCommentByRegexps will merge multi pattern regs to one special comment.
 func addSpecialCommentByRegexps(ddlQuery string, prefix string, regs ...*regexp.Regexp) string {
 	upperQuery := strings.ToUpper(ddlQuery)
 	var specialComments []string
 	minIdx := math.MaxInt64
 	for i := 0; i < len(regs); {
 		reg := regs[i]
-		loc := reg.FindStringIndex(upperQuery)
+		locs := reg.FindStringSubmatchIndex(upperQuery)
+		ns := reg.SubexpNames()
+		var loc []int
+		if len(locs) > 0 {
+			for i, n := range ns {
+				if n == "REPLACE" {
+					loc = locs[i*2 : (i+1)*2]
+					break
+				}
+			}
+		}
 		if len(loc) < 2 {
 			i++
 			continue

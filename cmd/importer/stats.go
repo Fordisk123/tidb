@@ -15,8 +15,8 @@ package main
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"time"
 
 	"github.com/pingcap/errors"
@@ -29,7 +29,7 @@ import (
 )
 
 func loadStats(tblInfo *model.TableInfo, path string) (*stats.Table, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -83,7 +83,7 @@ func getValidPrefix(lower, upper string) string {
 			randCh := uint8(rand.Intn(int(upper[i]-lower[i]))) + lower[i]
 			newBytes := make([]byte, i, i+1)
 			copy(newBytes, lower[:i])
-			newBytes = append(newBytes, byte(randCh))
+			newBytes = append(newBytes, randCh)
 			return string(newBytes)
 		}
 	}

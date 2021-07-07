@@ -43,7 +43,7 @@ var vecBuiltinMiscellaneousCases = map[string][]vecExprBenchCase{
 			newSelectStringGener(
 				[]string{
 					"192.168.0.1",
-					"2001:db8::68", //ipv6
+					"2001:db8::68", // ipv6
 				},
 			)}},
 	},
@@ -98,6 +98,14 @@ var vecBuiltinMiscellaneousCases = map[string][]vecExprBenchCase{
 		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETString, types.ETReal}},
 		{retEvalType: types.ETJson, childrenTypes: []types.EvalType{types.ETString, types.ETJson}},
 		{retEvalType: types.ETTimestamp, childrenTypes: []types.EvalType{types.ETString, types.ETTimestamp}},
+	},
+	ast.UUIDToBin: {
+		{retEvalType: types.ETString, childrenTypes: []types.EvalType{types.ETString}, geners: []dataGenerator{&uuidStrGener{newDefaultRandGen()}}},
+		{retEvalType: types.ETString, childrenTypes: []types.EvalType{types.ETString, types.ETInt}, geners: []dataGenerator{&uuidStrGener{newDefaultRandGen()}}},
+	},
+	ast.BinToUUID: {
+		{retEvalType: types.ETString, childrenTypes: []types.EvalType{types.ETString}, geners: []dataGenerator{&uuidBinGener{newDefaultRandGen()}}},
+		{retEvalType: types.ETString, childrenTypes: []types.EvalType{types.ETString, types.ETInt}, geners: []dataGenerator{&uuidBinGener{newDefaultRandGen()}}},
 	},
 }
 
@@ -187,7 +195,7 @@ func (s *testEvaluatorSuite) TestSleepVectorized(c *C) {
 	c.Assert(err, NotNil)
 	c.Assert(result.GetInt64(0), Equals, int64(0))
 
-	//// strict model
+	// strict model
 	input.Reset()
 	input.AppendFloat64(0, 0.5)
 	start := time.Now()
@@ -199,7 +207,7 @@ func (s *testEvaluatorSuite) TestSleepVectorized(c *C) {
 
 	input.Reset()
 	input.AppendFloat64(0, 0.01)
-	input.AppendFloat64(0, 1)
+	input.AppendFloat64(0, 2)
 	input.AppendFloat64(0, 2)
 	start = time.Now()
 	go func() {

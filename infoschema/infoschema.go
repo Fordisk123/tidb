@@ -16,17 +16,14 @@ package infoschema
 import (
 	"fmt"
 	"sort"
-	"sync/atomic"
+	"sync"
 
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/ddl/placement"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/logutil"
-	"go.uber.org/zap"
 )
 
 // InfoSchema is the interface used to retrieve the schema information.
@@ -49,7 +46,15 @@ type InfoSchema interface {
 	SchemaMetaVersion() int64
 	// TableIsView indicates whether the schema.table is a view.
 	TableIsView(schema, table model.CIStr) bool
-	FindTableByPartitionID(partitionID int64) (table.Table, *model.DBInfo)
+	// TableIsSequence indicates whether the schema.table is a sequence.
+	TableIsSequence(schema, table model.CIStr) bool
+	FindTableByPartitionID(partitionID int64) (table.Table, *model.DBInfo, *model.PartitionDefinition)
+	// BundleByName is used to get a rule bundle.
+	BundleByName(name string) (*placement.Bundle, bool)
+	// SetBundle is used internally to update rule bundles or mock tests.
+	SetBundle(*placement.Bundle)
+	// RuleBundles will return a copy of all rule bundles.
+	RuleBundles() []*placement.Bundle
 }
 
 type sortedTables []table.Table
@@ -84,6 +89,10 @@ type schemaTables struct {
 const bucketCount = 512
 
 type infoSchema struct {
+	// ruleBundleMap stores all placement rules
+	ruleBundleMutex sync.RWMutex
+	ruleBundleMap   map[string]*placement.Bundle
+
 	schemaMap map[string]*schemaTables
 
 	// sortedTablesBuckets is a slice of sortedTables, a table's bucket index is (tableID % bucketCount).
@@ -97,6 +106,7 @@ type infoSchema struct {
 func MockInfoSchema(tbList []*model.TableInfo) InfoSchema {
 	result := &infoSchema{}
 	result.schemaMap = make(map[string]*schemaTables)
+	result.ruleBundleMap = make(map[string]*placement.Bundle)
 	result.sortedTablesBuckets = make([]sortedTables, bucketCount)
 	dbInfo := &model.DBInfo{ID: 0, Name: model.NewCIStr("test"), Tables: tbList}
 	tableNames := &schemaTables{
@@ -113,6 +123,31 @@ func MockInfoSchema(tbList []*model.TableInfo) InfoSchema {
 	for i := range result.sortedTablesBuckets {
 		sort.Sort(result.sortedTablesBuckets[i])
 	}
+	return result
+}
+
+// MockInfoSchemaWithSchemaVer only serves for test.
+func MockInfoSchemaWithSchemaVer(tbList []*model.TableInfo, schemaVer int64) InfoSchema {
+	result := &infoSchema{}
+	result.schemaMap = make(map[string]*schemaTables)
+	result.ruleBundleMap = make(map[string]*placement.Bundle)
+	result.sortedTablesBuckets = make([]sortedTables, bucketCount)
+	dbInfo := &model.DBInfo{ID: 0, Name: model.NewCIStr("test"), Tables: tbList}
+	tableNames := &schemaTables{
+		dbInfo: dbInfo,
+		tables: make(map[string]table.Table),
+	}
+	result.schemaMap["test"] = tableNames
+	for _, tb := range tbList {
+		tbl := table.MockTableFromMeta(tb)
+		tableNames.tables[tb.Name.L] = tbl
+		bucketIdx := tableBucketIdx(tb.ID)
+		result.sortedTablesBuckets[bucketIdx] = append(result.sortedTablesBuckets[bucketIdx], tbl)
+	}
+	for i := range result.sortedTablesBuckets {
+		sort.Sort(result.sortedTablesBuckets[i])
+	}
+	result.schemaMetaVersion = schemaVer
 	return result
 }
 
@@ -148,6 +183,15 @@ func (is *infoSchema) TableIsView(schema, table model.CIStr) bool {
 	if tbNames, ok := is.schemaMap[schema.L]; ok {
 		if t, ok := tbNames.tables[table.L]; ok {
 			return t.Meta().IsView()
+		}
+	}
+	return false
+}
+
+func (is *infoSchema) TableIsSequence(schema, table model.CIStr) bool {
+	if tbNames, ok := is.schemaMap[schema.L]; ok {
+		if t, ok := tbNames.tables[table.L]; ok {
+			return t.Meta().IsSequence()
 		}
 	}
 	return false
@@ -229,7 +273,7 @@ func (is *infoSchema) SchemaTables(schema model.CIStr) (tables []table.Table) {
 
 // FindTableByPartitionID finds the partition-table info by the partitionID.
 // FindTableByPartitionID will traverse all the tables to find the partitionID partition in which partition-table.
-func (is *infoSchema) FindTableByPartitionID(partitionID int64) (table.Table, *model.DBInfo) {
+func (is *infoSchema) FindTableByPartitionID(partitionID int64) (table.Table, *model.DBInfo, *model.PartitionDefinition) {
 	for _, v := range is.schemaMap {
 		for _, tbl := range v.tables {
 			pi := tbl.Meta().GetPartitionInfo()
@@ -238,12 +282,12 @@ func (is *infoSchema) FindTableByPartitionID(partitionID int64) (table.Table, *m
 			}
 			for _, p := range pi.Definitions {
 				if p.ID == partitionID {
-					return tbl, v.dbInfo
+					return tbl, v.dbInfo, &p
 				}
 			}
 		}
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
 func (is *infoSchema) Clone() (result []*model.DBInfo) {
@@ -261,43 +305,9 @@ func (is *infoSchema) SequenceByName(schema, sequence model.CIStr) (util.Sequenc
 		return nil, err
 	}
 	if !tbl.Meta().IsSequence() {
-		return nil, err
+		return nil, ErrWrongObject.GenWithStackByArgs(schema, sequence, "SEQUENCE")
 	}
 	return tbl.(util.SequenceTable), nil
-}
-
-// Handle handles information schema, including getting and setting.
-type Handle struct {
-	value atomic.Value
-	store kv.Storage
-}
-
-// NewHandle creates a new Handle.
-func NewHandle(store kv.Storage) *Handle {
-	h := &Handle{
-		store: store,
-	}
-	return h
-}
-
-// Get gets information schema from Handle.
-func (h *Handle) Get() InfoSchema {
-	v := h.value.Load()
-	schema, _ := v.(InfoSchema)
-	return schema
-}
-
-// IsValid uses to check whether handle value is valid.
-func (h *Handle) IsValid() bool {
-	return h.value.Load() != nil
-}
-
-// EmptyClone creates a new Handle with the same store and memSchema, but the value is not set.
-func (h *Handle) EmptyClone() *Handle {
-	newHandle := &Handle{
-		store: h.store,
-	}
-	return newHandle
 }
 
 func init() {
@@ -336,16 +346,215 @@ func HasAutoIncrementColumn(tbInfo *model.TableInfo) (bool, string) {
 	return false, ""
 }
 
-// GetInfoSchema gets TxnCtx InfoSchema if snapshot schema is not set,
-// Otherwise, snapshot schema is returned.
-func GetInfoSchema(ctx sessionctx.Context) InfoSchema {
-	sessVar := ctx.GetSessionVars()
-	var is InfoSchema
-	if snap := sessVar.SnapshotInfoschema; snap != nil {
-		is = snap.(InfoSchema)
-		logutil.BgLogger().Info("use snapshot schema", zap.Uint64("conn", sessVar.ConnectionID), zap.Int64("schemaVersion", is.SchemaMetaVersion()))
-	} else {
-		is = sessVar.TxnCtx.InfoSchema.(InfoSchema)
+func (is *infoSchema) BundleByName(name string) (*placement.Bundle, bool) {
+	is.ruleBundleMutex.RLock()
+	defer is.ruleBundleMutex.RUnlock()
+	t, r := is.ruleBundleMap[name]
+	return t, r
+}
+
+func (is *infoSchema) RuleBundles() []*placement.Bundle {
+	is.ruleBundleMutex.RLock()
+	defer is.ruleBundleMutex.RUnlock()
+	bundles := make([]*placement.Bundle, 0, len(is.ruleBundleMap))
+	for _, bundle := range is.ruleBundleMap {
+		bundles = append(bundles, bundle)
 	}
-	return is
+	return bundles
+}
+
+func (is *infoSchema) SetBundle(bundle *placement.Bundle) {
+	is.ruleBundleMutex.Lock()
+	defer is.ruleBundleMutex.Unlock()
+	is.ruleBundleMap[bundle.ID] = bundle
+}
+
+func (is *infoSchema) deleteBundle(id string) {
+	is.ruleBundleMutex.Lock()
+	defer is.ruleBundleMutex.Unlock()
+	delete(is.ruleBundleMap, id)
+}
+
+// GetBundle get the first available bundle by array of IDs, possibbly fallback to the default.
+// If fallback to the default, only rules applied to all regions(empty keyrange) will be returned.
+// If the default bundle is unavailable, an empty bundle with an GroupID(ids[0]) is returned.
+func GetBundle(h InfoSchema, ids []int64) *placement.Bundle {
+	for _, id := range ids {
+		b, ok := h.BundleByName(placement.GroupID(id))
+		if ok {
+			return b.Clone()
+		}
+	}
+
+	newRules := []*placement.Rule{}
+
+	b, ok := h.BundleByName(placement.PDBundleID)
+	if ok {
+		for _, rule := range b.Rules {
+			if rule.StartKeyHex == "" && rule.EndKeyHex == "" {
+				newRules = append(newRules, rule.Clone())
+			}
+		}
+	}
+
+	id := int64(-1)
+	if len(ids) > 0 {
+		id = ids[0]
+	}
+	return &placement.Bundle{ID: placement.GroupID(id), Rules: newRules}
+}
+
+type schemaLocalTempSchemaTables struct {
+	tables map[string]table.Table
+}
+
+// LocalTemporaryTables store local temporary tables
+type LocalTemporaryTables struct {
+	schemaMap map[string]*schemaLocalTempSchemaTables
+	idx2table map[int64]table.Table
+}
+
+// NewLocalTemporaryTables creates a new NewLocalTemporaryTables object
+func NewLocalTemporaryTables() *LocalTemporaryTables {
+	return &LocalTemporaryTables{
+		schemaMap: make(map[string]*schemaLocalTempSchemaTables),
+		idx2table: make(map[int64]table.Table),
+	}
+}
+
+// TableByName get table by name
+func (is *LocalTemporaryTables) TableByName(schema, table model.CIStr) (table.Table, bool) {
+	if tbNames, ok := is.schemaMap[schema.L]; ok {
+		if t, ok := tbNames.tables[table.L]; ok {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// TableExists check if table with the name exists
+func (is *LocalTemporaryTables) TableExists(schema, table model.CIStr) (ok bool) {
+	_, ok = is.TableByName(schema, table)
+	return
+}
+
+// TableByID get table by table id
+func (is *LocalTemporaryTables) TableByID(id int64) (tbl table.Table, ok bool) {
+	tbl, ok = is.idx2table[id]
+	return
+}
+
+// AddTable add a table
+func (is *LocalTemporaryTables) AddTable(schema *model.DBInfo, tbl table.Table) error {
+	schemaTables := is.ensureSchema(schema.Name)
+
+	tblMeta := tbl.Meta()
+	if _, ok := schemaTables.tables[tblMeta.Name.L]; ok {
+		return ErrTableExists.GenWithStackByArgs(tblMeta.Name)
+	}
+
+	if _, ok := is.idx2table[tblMeta.ID]; ok {
+		return ErrTableExists.GenWithStackByArgs(tblMeta.Name)
+	}
+
+	schemaTables.tables[tblMeta.Name.L] = tbl
+	is.idx2table[tblMeta.ID] = tbl
+
+	return nil
+}
+
+// RemoveTable remove a table
+func (is *LocalTemporaryTables) RemoveTable(schema, table model.CIStr) (exist bool) {
+	tbls := is.schemaTables(schema)
+	if tbls == nil {
+		return false
+	}
+
+	oldTable, exist := tbls.tables[table.L]
+	if !exist {
+		return false
+	}
+
+	delete(tbls.tables, table.L)
+	delete(is.idx2table, oldTable.Meta().ID)
+	return true
+}
+
+// SchemaByTable get a table's schema name
+func (is *LocalTemporaryTables) SchemaByTable(tableInfo *model.TableInfo) (string, bool) {
+	if tableInfo == nil {
+		return "", false
+	}
+
+	for schema, v := range is.schemaMap {
+		if tbl, ok := v.tables[tableInfo.Name.L]; ok {
+			if tbl.Meta().ID == tableInfo.ID {
+				return schema, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+func (is *LocalTemporaryTables) ensureSchema(schema model.CIStr) *schemaLocalTempSchemaTables {
+	if tbls, ok := is.schemaMap[schema.L]; ok {
+		return tbls
+	}
+
+	tbls := &schemaLocalTempSchemaTables{tables: make(map[string]table.Table)}
+	is.schemaMap[schema.L] = tbls
+	return tbls
+}
+
+func (is *LocalTemporaryTables) schemaTables(schema model.CIStr) *schemaLocalTempSchemaTables {
+	if is.schemaMap == nil {
+		return nil
+	}
+
+	if tbls, ok := is.schemaMap[schema.L]; ok {
+		return tbls
+	}
+
+	return nil
+}
+
+// TemporaryTableAttachedInfoSchema implements InfoSchema
+// Local temporary table has a loose relationship with database.
+// So when a database is dropped, its temporary tables still exist and can be return by TableByName/TableByID.
+// However SchemaByTable will return nil if database is dropped.
+type TemporaryTableAttachedInfoSchema struct {
+	InfoSchema
+	LocalTemporaryTables *LocalTemporaryTables
+}
+
+// TableByName implements InfoSchema.TableByName
+func (ts *TemporaryTableAttachedInfoSchema) TableByName(schema, table model.CIStr) (table.Table, error) {
+	if tbl, ok := ts.LocalTemporaryTables.TableByName(schema, table); ok {
+		return tbl, nil
+	}
+
+	return ts.InfoSchema.TableByName(schema, table)
+}
+
+// TableByID implements InfoSchema.TableByID
+func (ts *TemporaryTableAttachedInfoSchema) TableByID(id int64) (table.Table, bool) {
+	if tbl, ok := ts.LocalTemporaryTables.TableByID(id); ok {
+		return tbl, true
+	}
+
+	return ts.InfoSchema.TableByID(id)
+}
+
+// SchemaByTable implements InfoSchema.SchemaByTable
+func (ts *TemporaryTableAttachedInfoSchema) SchemaByTable(tableInfo *model.TableInfo) (*model.DBInfo, bool) {
+	if tableInfo == nil {
+		return nil, false
+	}
+
+	if schemaName, ok := ts.LocalTemporaryTables.SchemaByTable(tableInfo); ok {
+		return ts.SchemaByName(model.NewCIStr(schemaName))
+	}
+
+	return ts.InfoSchema.SchemaByTable(tableInfo)
 }

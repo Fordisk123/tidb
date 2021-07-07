@@ -21,7 +21,8 @@ import (
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
-	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/planner/util"
 )
 
 type columnPruner struct {
@@ -88,28 +89,48 @@ func (la *LogicalAggregation) PruneColumns(parentUsedCols []*expression.Column) 
 	child := la.children[0]
 	used := expression.GetUsedList(parentUsedCols, la.Schema())
 
+	allFirstRow := true
+	allRemainFirstRow := true
 	for i := len(used) - 1; i >= 0; i-- {
+		if la.AggFuncs[i].Name != ast.AggFuncFirstRow {
+			allFirstRow = false
+		}
 		if !used[i] {
 			la.schema.Columns = append(la.schema.Columns[:i], la.schema.Columns[i+1:]...)
 			la.AggFuncs = append(la.AggFuncs[:i], la.AggFuncs[i+1:]...)
+		} else if la.AggFuncs[i].Name != ast.AggFuncFirstRow {
+			allRemainFirstRow = false
 		}
 	}
 	var selfUsedCols []*expression.Column
 	for _, aggrFunc := range la.AggFuncs {
 		selfUsedCols = expression.ExtractColumnsFromExpressions(selfUsedCols, aggrFunc.Args, nil)
+
+		var cols []*expression.Column
+		aggrFunc.OrderByItems, cols = pruneByItems(aggrFunc.OrderByItems)
+		selfUsedCols = append(selfUsedCols, cols...)
 	}
-	if len(la.AggFuncs) == 0 {
-		// If all the aggregate functions are pruned, we should add an aggregate function to keep the correctness.
-		one, err := aggregation.NewAggFuncDesc(la.ctx, ast.AggFuncFirstRow, []expression.Expression{expression.One}, false)
+	if len(la.AggFuncs) == 0 || (!allFirstRow && allRemainFirstRow) {
+		// If all the aggregate functions are pruned, we should add an aggregate function to maintain the info of row numbers.
+		// For all the aggregate functions except `first_row`, if we have an empty table defined as t(a,b),
+		// `select agg(a) from t` would always return one row, while `select agg(a) from t group by b` would return empty.
+		// For `first_row` which is only used internally by tidb, `first_row(a)` would always return empty for empty input now.
+		var err error
+		var newAgg *aggregation.AggFuncDesc
+		if allFirstRow {
+			newAgg, err = aggregation.NewAggFuncDesc(la.ctx, ast.AggFuncFirstRow, []expression.Expression{expression.NewOne()}, false)
+		} else {
+			newAgg, err = aggregation.NewAggFuncDesc(la.ctx, ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+		}
 		if err != nil {
 			return err
 		}
-		la.AggFuncs = []*aggregation.AggFuncDesc{one}
+		la.AggFuncs = append(la.AggFuncs, newAgg)
 		col := &expression.Column{
 			UniqueID: la.ctx.GetSessionVars().AllocPlanColumnID(),
-			RetType:  types.NewFieldType(mysql.TypeLonglong),
+			RetType:  newAgg.RetTp,
 		}
-		la.schema.Columns = []*expression.Column{col}
+		la.schema.Columns = append(la.schema.Columns, col)
 	}
 
 	if len(la.GroupByItems) > 0 {
@@ -124,10 +145,34 @@ func (la *LogicalAggregation) PruneColumns(parentUsedCols []*expression.Column) 
 		// If all the group by items are pruned, we should add a constant 1 to keep the correctness.
 		// Because `select count(*) from t` is different from `select count(*) from t group by 1`.
 		if len(la.GroupByItems) == 0 {
-			la.GroupByItems = []expression.Expression{expression.One}
+			la.GroupByItems = []expression.Expression{expression.NewOne()}
 		}
 	}
 	return child.PruneColumns(selfUsedCols)
+}
+
+func pruneByItems(old []*util.ByItems) (new []*util.ByItems, parentUsedCols []*expression.Column) {
+	new = make([]*util.ByItems, 0, len(old))
+	seen := make(map[string]struct{}, len(old))
+	for _, byItem := range old {
+		hash := string(byItem.Expr.HashCode(nil))
+		_, hashMatch := seen[hash]
+		seen[hash] = struct{}{}
+		cols := expression.ExtractColumns(byItem.Expr)
+		if hashMatch {
+			// do nothing, should be filtered
+		} else if len(cols) == 0 {
+			if !expression.IsRuntimeConstExpr(byItem.Expr) {
+				new = append(new, byItem)
+			}
+		} else if byItem.Expr.GetType().Tp == mysql.TypeNull {
+			// do nothing, should be filtered
+		} else {
+			parentUsedCols = append(parentUsedCols, cols...)
+			new = append(new, byItem)
+		}
+	}
+	return
 }
 
 // PruneColumns implements LogicalPlan interface.
@@ -135,19 +180,9 @@ func (la *LogicalAggregation) PruneColumns(parentUsedCols []*expression.Column) 
 // we do prune them. Note that we can't prune the expressions contain non-deterministic functions, such as rand().
 func (ls *LogicalSort) PruneColumns(parentUsedCols []*expression.Column) error {
 	child := ls.children[0]
-	for i := len(ls.ByItems) - 1; i >= 0; i-- {
-		cols := expression.ExtractColumns(ls.ByItems[i].Expr)
-		if len(cols) == 0 {
-			if expression.IsMutableEffectsExpr(ls.ByItems[i].Expr) {
-				continue
-			}
-			ls.ByItems = append(ls.ByItems[:i], ls.ByItems[i+1:]...)
-		} else if ls.ByItems[i].Expr.GetType().Tp == mysql.TypeNull {
-			ls.ByItems = append(ls.ByItems[:i], ls.ByItems[i+1:]...)
-		} else {
-			parentUsedCols = append(parentUsedCols, cols...)
-		}
-	}
+	var cols []*expression.Column
+	ls.ByItems, cols = pruneByItems(ls.ByItems)
+	parentUsedCols = append(parentUsedCols, cols...)
 	return child.PruneColumns(parentUsedCols)
 }
 
@@ -156,19 +191,9 @@ func (ls *LogicalSort) PruneColumns(parentUsedCols []*expression.Column) error {
 // we do prune them. Note that we can't prune the expressions contain non-deterministic functions, such as rand().
 func (lt *LogicalTopN) PruneColumns(parentUsedCols []*expression.Column) error {
 	child := lt.children[0]
-	for i := len(lt.ByItems) - 1; i >= 0; i-- {
-		cols := expression.ExtractColumns(lt.ByItems[i].Expr)
-		if len(cols) == 0 {
-			if expression.IsMutableEffectsExpr(lt.ByItems[i].Expr) {
-				continue
-			}
-			lt.ByItems = append(lt.ByItems[:i], lt.ByItems[i+1:]...)
-		} else if lt.ByItems[i].Expr.GetType().Tp == mysql.TypeNull {
-			lt.ByItems = append(lt.ByItems[:i], lt.ByItems[i+1:]...)
-		} else {
-			parentUsedCols = append(parentUsedCols, cols...)
-		}
-	}
+	var cols []*expression.Column
+	lt.ByItems, cols = pruneByItems(lt.ByItems)
+	parentUsedCols = append(parentUsedCols, cols...)
 	return child.PruneColumns(parentUsedCols)
 }
 
@@ -207,7 +232,11 @@ func (p *LogicalUnionAll) PruneColumns(parentUsedCols []*expression.Column) erro
 
 // PruneColumns implements LogicalPlan interface.
 func (p *LogicalUnionScan) PruneColumns(parentUsedCols []*expression.Column) error {
-	parentUsedCols = append(parentUsedCols, p.handleCol)
+	for i := 0; i < p.handleCols.NumCols(); i++ {
+		parentUsedCols = append(parentUsedCols, p.handleCols.GetCol(i))
+	}
+	condCols := expression.ExtractColumnsFromExpressions(nil, p.conditions, nil)
+	parentUsedCols = append(parentUsedCols, condCols...)
 	return p.children[0].PruneColumns(parentUsedCols)
 }
 
@@ -218,14 +247,6 @@ func (ds *DataSource) PruneColumns(parentUsedCols []*expression.Column) error {
 	exprCols := expression.ExtractColumnsFromExpressions(nil, ds.allConds, nil)
 	exprUsed := expression.GetUsedList(exprCols, ds.schema)
 
-	var (
-		handleCol     *expression.Column
-		handleColInfo *model.ColumnInfo
-	)
-	if ds.handleCol != nil {
-		handleCol = ds.handleCol
-		handleColInfo = ds.Columns[ds.schema.ColumnIndex(handleCol)]
-	}
 	originSchemaColumns := ds.schema.Columns
 	originColumns := ds.Columns
 	for i := len(used) - 1; i >= 0; i-- {
@@ -237,19 +258,47 @@ func (ds *DataSource) PruneColumns(parentUsedCols []*expression.Column) error {
 	// For SQL like `select 1 from t`, tikv's response will be empty if no column is in schema.
 	// So we'll force to push one if schema doesn't have any column.
 	if ds.schema.Len() == 0 {
+		var handleCol *expression.Column
+		var handleColInfo *model.ColumnInfo
 		if ds.table.Type().IsClusterTable() && len(originColumns) > 0 {
 			// use the first line.
 			handleCol = originSchemaColumns[0]
 			handleColInfo = originColumns[0]
-		} else if handleCol == nil {
-			handleCol = ds.newExtraHandleSchemaCol()
-			handleColInfo = model.NewExtraHandleColInfo()
+		} else {
+			if ds.handleCols != nil {
+				handleCol = ds.handleCols.GetCol(0)
+				handleColInfo = handleCol.ToInfo()
+			} else {
+				handleCol = ds.newExtraHandleSchemaCol()
+				handleColInfo = model.NewExtraHandleColInfo()
+			}
 		}
 		ds.Columns = append(ds.Columns, handleColInfo)
 		ds.schema.Append(handleCol)
 	}
-	if ds.handleCol != nil && ds.schema.ColumnIndex(ds.handleCol) == -1 {
-		ds.handleCol = nil
+	if ds.handleCols != nil && ds.handleCols.IsInt() && ds.schema.ColumnIndex(ds.handleCols.GetCol(0)) == -1 {
+		ds.handleCols = nil
+	}
+	return nil
+}
+
+// PruneColumns implements LogicalPlan interface.
+func (p *LogicalMemTable) PruneColumns(parentUsedCols []*expression.Column) error {
+	switch p.TableInfo.Name.O {
+	case infoschema.TableStatementsSummary,
+		infoschema.TableStatementsSummaryHistory,
+		infoschema.ClusterTableStatementsSummary,
+		infoschema.ClusterTableStatementsSummaryHistory:
+		// currently prune mem-table column only use for statements summary table.
+	default:
+		return nil
+	}
+	used := expression.GetUsedList(parentUsedCols, p.schema)
+	for i := len(used) - 1; i >= 0; i-- {
+		if !used[i] && p.schema.Len() > 1 {
+			p.schema.Columns = append(p.schema.Columns[:i], p.schema.Columns[i+1:]...)
+			p.Columns = append(p.Columns[:i], p.Columns[i+1:]...)
+		}
 	}
 	return nil
 }
@@ -292,17 +341,7 @@ func (p *LogicalJoin) extractUsedCols(parentUsedCols []*expression.Column) (left
 }
 
 func (p *LogicalJoin) mergeSchema() {
-	lChild := p.children[0]
-	rChild := p.children[1]
-	if p.JoinType == SemiJoin || p.JoinType == AntiSemiJoin {
-		p.schema = lChild.Schema().Clone()
-	} else if p.JoinType == LeftOuterSemiJoin || p.JoinType == AntiLeftOuterSemiJoin {
-		joinCol := p.schema.Columns[len(p.schema.Columns)-1]
-		p.schema = lChild.Schema().Clone()
-		p.schema.Append(joinCol)
-	} else {
-		p.schema = expression.MergeSchema(lChild.Schema(), rChild.Schema())
-	}
+	p.schema = buildLogicalJoinSchema(p.JoinType, p)
 }
 
 // PruneColumns implements LogicalPlan interface.
@@ -313,11 +352,13 @@ func (p *LogicalJoin) PruneColumns(parentUsedCols []*expression.Column) error {
 	if err != nil {
 		return err
 	}
+	addConstOneForEmptyProjection(p.children[0])
 
 	err = p.children[1].PruneColumns(rightCols)
 	if err != nil {
 		return err
 	}
+	addConstOneForEmptyProjection(p.children[1])
 
 	p.mergeSchema()
 	if p.JoinType == LeftOuterSemiJoin || p.JoinType == AntiLeftOuterSemiJoin {
@@ -336,8 +377,9 @@ func (la *LogicalApply) PruneColumns(parentUsedCols []*expression.Column) error 
 	if err != nil {
 		return err
 	}
+	addConstOneForEmptyProjection(la.children[1])
 
-	la.CorCols = extractCorColumnsBySchema(la.children[1], la.children[0].Schema())
+	la.CorCols = extractCorColumnsBySchema4LogicalPlan(la.children[1], la.children[0].Schema())
 	for _, col := range la.CorCols {
 		leftCols = append(leftCols, &col.Column)
 	}
@@ -346,6 +388,7 @@ func (la *LogicalApply) PruneColumns(parentUsedCols []*expression.Column) error 
 	if err != nil {
 		return err
 	}
+	addConstOneForEmptyProjection(la.children[0])
 
 	la.mergeSchema()
 	return nil
@@ -353,18 +396,21 @@ func (la *LogicalApply) PruneColumns(parentUsedCols []*expression.Column) error 
 
 // PruneColumns implements LogicalPlan interface.
 func (p *LogicalLock) PruneColumns(parentUsedCols []*expression.Column) error {
-	if p.Lock != ast.SelectLockForUpdate && p.Lock != ast.SelectLockForUpdateNoWait {
+	if !IsSelectForUpdateLockType(p.Lock.LockType) {
 		return p.baseLogicalPlan.PruneColumns(parentUsedCols)
 	}
 
 	if len(p.partitionedTable) > 0 {
-		// If the children include partitioned tables, do not prune columns.
-		// Because the executor needs the partitioned columns to calculate the lock key.
-		return p.children[0].PruneColumns(p.Schema().Columns)
+		// If the children include partitioned tables, there is an extra partition ID column.
+		parentUsedCols = append(parentUsedCols, p.extraPIDInfo.Columns...)
 	}
 
 	for _, cols := range p.tblID2Handle {
-		parentUsedCols = append(parentUsedCols, cols...)
+		for _, col := range cols {
+			for i := 0; i < col.NumCols(); i++ {
+				parentUsedCols = append(parentUsedCols, col.GetCol(i))
+			}
+		}
 	}
 	return p.children[0].PruneColumns(parentUsedCols)
 }
@@ -372,7 +418,7 @@ func (p *LogicalLock) PruneColumns(parentUsedCols []*expression.Column) error {
 // PruneColumns implements LogicalPlan interface.
 func (p *LogicalWindow) PruneColumns(parentUsedCols []*expression.Column) error {
 	windowColumns := p.GetWindowResultColumns()
-	len := 0
+	cnt := 0
 	for _, col := range parentUsedCols {
 		used := false
 		for _, windowColumn := range windowColumns {
@@ -382,11 +428,11 @@ func (p *LogicalWindow) PruneColumns(parentUsedCols []*expression.Column) error 
 			}
 		}
 		if !used {
-			parentUsedCols[len] = col
-			len++
+			parentUsedCols[cnt] = col
+			cnt++
 		}
 	}
-	parentUsedCols = parentUsedCols[:len]
+	parentUsedCols = parentUsedCols[:cnt]
 	parentUsedCols = p.extractUsedCols(parentUsedCols)
 	err := p.children[0].PruneColumns(parentUsedCols)
 	if err != nil {
@@ -413,6 +459,44 @@ func (p *LogicalWindow) extractUsedCols(parentUsedCols []*expression.Column) []*
 	return parentUsedCols
 }
 
+// PruneColumns implements LogicalPlan interface.
+func (p *LogicalLimit) PruneColumns(parentUsedCols []*expression.Column) error {
+	if len(parentUsedCols) == 0 { // happens when LIMIT appears in UPDATE.
+		return nil
+	}
+
+	savedUsedCols := make([]*expression.Column, len(parentUsedCols))
+	copy(savedUsedCols, parentUsedCols)
+	if err := p.children[0].PruneColumns(parentUsedCols); err != nil {
+		return err
+	}
+	p.schema = nil
+	p.inlineProjection(savedUsedCols)
+	return nil
+}
+
 func (*columnPruner) name() string {
 	return "column_prune"
+}
+
+// By add const one, we can avoid empty Projection is eliminated.
+// Because in some cases, Projectoin cannot be eliminated even its output is empty.
+func addConstOneForEmptyProjection(p LogicalPlan) {
+	proj, ok := p.(*LogicalProjection)
+	if !ok {
+		return
+	}
+	if proj.Schema().Len() != 0 {
+		return
+	}
+
+	constOne := expression.NewOne()
+	proj.schema.Append(&expression.Column{
+		UniqueID: proj.ctx.GetSessionVars().AllocPlanColumnID(),
+		RetType:  constOne.GetType(),
+	})
+	proj.Exprs = append(proj.Exprs, &expression.Constant{
+		Value:   constOne.Value,
+		RetType: constOne.GetType(),
+	})
 }

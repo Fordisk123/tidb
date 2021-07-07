@@ -38,7 +38,7 @@ type joinGroupNonEqEdge struct {
 
 func (s *joinReorderDPSolver) solve(joinGroup []LogicalPlan, eqConds []expression.Expression) (LogicalPlan, error) {
 	for _, node := range joinGroup {
-		_, err := node.recursiveDeriveStats()
+		_, err := node.recursiveDeriveStats(nil)
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +245,7 @@ func (s *joinReorderDPSolver) newJoinWithEdge(leftPlan, rightPlan LogicalPlan, e
 		}
 	}
 	join := s.newJoin(leftPlan, rightPlan, eqConds, otherConds)
-	_, err := join.recursiveDeriveStats()
+	_, err := join.recursiveDeriveStats(nil)
 	return join, err
 }
 
@@ -280,11 +280,4 @@ func findNodeIndexInGroup(group []LogicalPlan, col *expression.Column) (int, err
 		}
 	}
 	return -1, ErrUnknownColumn.GenWithStackByArgs(col, "JOIN REORDER RULE")
-}
-
-func (s *joinReorderDPSolver) newJoinWithConds(leftPlan, rightPlan LogicalPlan, eqConds []*expression.ScalarFunction, otherConds []expression.Expression) LogicalPlan {
-	join := s.newCartesianJoin(leftPlan, rightPlan)
-	join.EqualConditions = eqConds
-	join.OtherConditions = otherConds
-	return join
 }

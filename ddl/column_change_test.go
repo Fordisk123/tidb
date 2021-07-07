@@ -17,17 +17,21 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/table/tables"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testutil"
@@ -43,15 +47,18 @@ type testColumnChangeSuite struct {
 func (s *testColumnChangeSuite) SetUpSuite(c *C) {
 	SetWaitTimeWhenErrorOccurred(1 * time.Microsecond)
 	s.store = testCreateStore(c, "test_column_change")
-	s.dbInfo = &model.DBInfo{
-		Name: model.NewCIStr("test_column_change"),
-		ID:   1,
-	}
-	err := kv.RunInNewTxn(s.store, true, func(txn kv.Transaction) error {
-		t := meta.NewMeta(txn)
-		return errors.Trace(t.CreateDatabase(s.dbInfo))
-	})
-	c.Check(err, IsNil)
+	d := testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(s.store),
+		WithLease(testLease),
+	)
+	defer func() {
+		err := d.Stop()
+		c.Assert(err, IsNil)
+	}()
+	s.dbInfo = testSchemaInfo(c, d, "test_index_change")
+	testCreateSchema(c, testNewContext(d), d, s.dbInfo)
 }
 
 func (s *testColumnChangeSuite) TearDownSuite(c *C) {
@@ -59,12 +66,16 @@ func (s *testColumnChangeSuite) TearDownSuite(c *C) {
 }
 
 func (s *testColumnChangeSuite) TestColumnChange(c *C) {
-	d := newDDL(
+	d := testNewDDLAndStart(
 		context.Background(),
+		c,
 		WithStore(s.store),
 		WithLease(testLease),
 	)
-	defer d.Stop()
+	defer func() {
+		err := d.Stop()
+		c.Assert(err, IsNil)
+	}()
 	// create table t (c1 int, c2 int);
 	tblInfo := testTableInfo(c, d, "t", 2)
 	ctx := testNewContext(d)
@@ -150,6 +161,79 @@ func (s *testColumnChangeSuite) TestColumnChange(c *C) {
 	s.testAddColumnNoDefault(c, ctx, d, tblInfo)
 }
 
+func (s *testColumnChangeSuite) TestModifyAutoRandColumnWithMetaKeyChanged(c *C) {
+	d := testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(s.store),
+		WithLease(testLease),
+	)
+	defer func() {
+		err := d.Stop()
+		c.Assert(err, IsNil)
+	}()
+
+	ids, err := d.genGlobalIDs(1)
+	tableID := ids[0]
+	c.Assert(err, IsNil)
+	colInfo := &model.ColumnInfo{
+		Name:      model.NewCIStr("a"),
+		Offset:    0,
+		State:     model.StatePublic,
+		FieldType: *types.NewFieldType(mysql.TypeLonglong),
+	}
+	tblInfo := &model.TableInfo{
+		ID:             tableID,
+		Name:           model.NewCIStr("auto_random_table_name"),
+		Columns:        []*model.ColumnInfo{colInfo},
+		AutoRandomBits: 5,
+	}
+	colInfo.ID = allocateColumnID(tblInfo)
+	ctx := testNewContext(d)
+	testCreateTable(c, ctx, d, s.dbInfo, tblInfo)
+
+	tc := &TestDDLCallback{}
+	var errCount int32 = 3
+	var genAutoRandErr error
+	tc.onJobRunBefore = func(job *model.Job) {
+		if atomic.LoadInt32(&errCount) > 0 && job.Type == model.ActionModifyColumn {
+			atomic.AddInt32(&errCount, -1)
+			genAutoRandErr = kv.RunInNewTxn(context.Background(), s.store, false, func(ctx context.Context, txn kv.Transaction) error {
+				t := meta.NewMeta(txn)
+				_, err1 := t.GenAutoRandomID(s.dbInfo.ID, tableID, 1)
+				return err1
+			})
+		}
+	}
+	d.SetHook(tc)
+	const newAutoRandomBits uint64 = 10
+	job := &model.Job{
+		SchemaID:   s.dbInfo.ID,
+		TableID:    tblInfo.ID,
+		SchemaName: s.dbInfo.Name.L,
+		Type:       model.ActionModifyColumn,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{colInfo, colInfo.Name, ast.ColumnPosition{}, 0, newAutoRandomBits},
+	}
+	err = d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+	c.Assert(errCount == 0, IsTrue)
+	c.Assert(genAutoRandErr, IsNil)
+	testCheckJobDone(c, d, job, true)
+	var newTbInfo *model.TableInfo
+	err = kv.RunInNewTxn(context.Background(), d.store, false, func(ctx context.Context, txn kv.Transaction) error {
+		t := meta.NewMeta(txn)
+		var err error
+		newTbInfo, err = t.GetTable(s.dbInfo.ID, tableID)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		return nil
+	})
+	c.Assert(err, IsNil)
+	c.Assert(newTbInfo.AutoRandomBits, Equals, newAutoRandomBits)
+}
+
 func (s *testColumnChangeSuite) testAddColumnNoDefault(c *C, ctx sessionctx.Context, d *ddl, tblInfo *model.TableInfo) {
 	tc := &TestDDLCallback{}
 	// set up hook
@@ -224,7 +308,29 @@ func (s *testColumnChangeSuite) testColumnDrop(c *C, ctx sessionctx.Context, d *
 	testDropColumn(c, ctx, d, s.dbInfo, tbl.Meta(), dropCol.Name.L, false)
 }
 
-func (s *testColumnChangeSuite) checkAddWriteOnly(ctx sessionctx.Context, d *ddl, deleteOnlyTable, writeOnlyTable table.Table, h int64) error {
+func seek(t table.PhysicalTable, ctx sessionctx.Context, h kv.Handle) (kv.Handle, bool, error) {
+	txn, err := ctx.Txn(true)
+	if err != nil {
+		return nil, false, err
+	}
+	recordPrefix := t.RecordPrefix()
+	seekKey := tablecodec.EncodeRowKeyWithHandle(t.GetPhysicalID(), h)
+	iter, err := txn.Iter(seekKey, recordPrefix.PrefixNext())
+	if err != nil {
+		return nil, false, err
+	}
+	if !iter.Valid() || !iter.Key().HasPrefix(recordPrefix) {
+		// No more records in the table, skip to the end.
+		return nil, false, nil
+	}
+	handle, err := tablecodec.DecodeRowKey(iter.Key())
+	if err != nil {
+		return nil, false, err
+	}
+	return handle, true, nil
+}
+
+func (s *testColumnChangeSuite) checkAddWriteOnly(ctx sessionctx.Context, d *ddl, deleteOnlyTable, writeOnlyTable table.Table, h kv.Handle) error {
 	// WriteOnlyTable: insert t values (2, 3)
 	err := ctx.NewTxn(context.Background())
 	if err != nil {
@@ -244,7 +350,7 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(ctx sessionctx.Context, d *ddl
 		return errors.Trace(err)
 	}
 	// This test is for RowWithCols when column state is StateWriteOnly.
-	row, err := writeOnlyTable.RowWithCols(ctx, h, writeOnlyTable.WritableCols())
+	row, err := tables.RowWithCols(writeOnlyTable, ctx, h, writeOnlyTable.WritableCols())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -259,11 +365,11 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(ctx sessionctx.Context, d *ddl
 		return errors.Trace(err)
 	}
 	// WriteOnlyTable: update t set c1 = 2 where c1 = 1
-	h, _, err = writeOnlyTable.Seek(ctx, 0)
+	h, _, err = seek(writeOnlyTable.(table.PhysicalTable), ctx, kv.IntHandle(0))
 	if err != nil {
 		return errors.Trace(err)
 	}
-	err = writeOnlyTable.UpdateRecord(ctx, h, types.MakeDatums(1, 2, 3), types.MakeDatums(2, 2, 3), touchedSlice(writeOnlyTable))
+	err = writeOnlyTable.UpdateRecord(context.Background(), ctx, h, types.MakeDatums(1, 2, 3), types.MakeDatums(2, 2, 3), touchedSlice(writeOnlyTable))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -314,7 +420,7 @@ func (s *testColumnChangeSuite) checkAddPublic(sctx sessionctx.Context, d *ddl, 
 		return errors.Trace(err)
 	}
 	// writeOnlyTable update t set c1 = 3 where c1 = 4
-	oldRow, err := writeOnlyTable.RowWithCols(sctx, h, writeOnlyTable.WritableCols())
+	oldRow, err := tables.RowWithCols(writeOnlyTable, sctx, h, writeOnlyTable.WritableCols())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -322,7 +428,7 @@ func (s *testColumnChangeSuite) checkAddPublic(sctx sessionctx.Context, d *ddl, 
 		return errors.Errorf("%v", oldRow)
 	}
 	newRow := types.MakeDatums(3, 4, oldRow[2].GetValue())
-	err = writeOnlyTable.UpdateRecord(sctx, h, oldRow, newRow, touchedSlice(writeOnlyTable))
+	err = writeOnlyTable.UpdateRecord(context.Background(), sctx, h, oldRow, newRow, touchedSlice(writeOnlyTable))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -340,7 +446,7 @@ func (s *testColumnChangeSuite) checkAddPublic(sctx sessionctx.Context, d *ddl, 
 
 func getCurrentTable(d *ddl, schemaID, tableID int64) (table.Table, error) {
 	var tblInfo *model.TableInfo
-	err := kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
+	err := kv.RunInNewTxn(context.Background(), d.store, false, func(ctx context.Context, txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		var err error
 		tblInfo, err = t.GetTable(schemaID, tableID)
@@ -362,7 +468,7 @@ func getCurrentTable(d *ddl, schemaID, tableID int64) (table.Table, error) {
 
 func checkResult(ctx sessionctx.Context, t table.Table, cols []*table.Column, rows [][]interface{}) error {
 	var gotRows [][]interface{}
-	err := t.IterRecords(ctx, t.FirstKey(), cols, func(h int64, data []types.Datum, cols []*table.Column) (bool, error) {
+	err := tables.IterRecords(t, ctx, cols, func(_ kv.Handle, data []types.Datum, cols []*table.Column) (bool, error) {
 		gotRows = append(gotRows, datumsToInterfaces(data))
 		return true, nil
 	})

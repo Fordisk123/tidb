@@ -14,12 +14,14 @@
 package util
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,6 +34,7 @@ import (
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tipb/go-tipb"
@@ -43,8 +46,6 @@ const (
 	DefaultMaxRetries = 30
 	// RetryInterval indicates retry interval.
 	RetryInterval uint64 = 500
-	// GCTimeFormat is the format that gc_worker used to store times.
-	GCTimeFormat = "20060102-15:04:05 -0700"
 )
 
 // RunWithRetry will run the f with backoff and retry.
@@ -93,24 +94,42 @@ func WithRecovery(exec func(), recoverFn func(r interface{})) {
 	exec()
 }
 
-// CompatibleParseGCTime parses a string with `GCTimeFormat` and returns a time.Time. If `value` can't be parsed as that
-// format, truncate to last space and try again. This function is only useful when loading times that saved by
-// gc_worker. We have changed the format that gc_worker saves time (removed the last field), but when loading times it
-// should be compatible with the old format.
-func CompatibleParseGCTime(value string) (time.Time, error) {
-	t, err := time.Parse(GCTimeFormat, value)
-
-	if err != nil {
-		// Remove the last field that separated by space
-		parts := strings.Split(value, " ")
-		prefix := strings.Join(parts[:len(parts)-1], " ")
-		t, err = time.Parse(GCTimeFormat, prefix)
+// Recover includes operations such as recovering, clearing，and printing information.
+// It will dump current goroutine stack into log if catch any recover result.
+//   metricsLabel: The label of PanicCounter metrics.
+//   funcInfo:     Some information for the panic function.
+//   recoverFn:    Handler will be called after recover and before dump stack, passing `nil` means noop.
+//   quit:         If this value is true, the current program exits after recovery.
+func Recover(metricsLabel, funcInfo string, recoverFn func(), quit bool) {
+	r := recover()
+	if r == nil {
+		return
 	}
 
-	if err != nil {
-		err = errors.Errorf("string \"%v\" doesn't has a prefix that matches format \"%v\"", value, GCTimeFormat)
+	if recoverFn != nil {
+		recoverFn()
 	}
-	return t, err
+	logutil.BgLogger().Error("panic in the recoverable goroutine",
+		zap.String("label", metricsLabel),
+		zap.String("funcInfo", funcInfo),
+		zap.Reflect("r", r),
+		zap.String("stack", string(GetStack())))
+	metrics.PanicCounter.WithLabelValues(metricsLabel).Inc()
+	if quit {
+		// Wait for metrics to be pushed.
+		time.Sleep(time.Second * 15)
+		os.Exit(1)
+	}
+}
+
+// HasCancelled checks whether context has be cancelled.
+func HasCancelled(ctx context.Context) (cancel bool) {
+	select {
+	case <-ctx.Done():
+		cancel = true
+	default:
+	}
+	return
 }
 
 const (
@@ -123,7 +142,7 @@ func SyntaxError(err error) error {
 	if err == nil {
 		return nil
 	}
-	logutil.BgLogger().Error("syntax error", zap.Error(err))
+	logutil.BgLogger().Debug("syntax error", zap.Error(err))
 
 	// If the error is already a terror with stack, pass it through.
 	if errors.HasStack(err) {
@@ -151,14 +170,36 @@ var (
 	PerformanceSchemaName = model.NewCIStr("PERFORMANCE_SCHEMA")
 	// MetricSchemaName is the `METRICS_SCHEMA` database name.
 	MetricSchemaName = model.NewCIStr("METRICS_SCHEMA")
+	// ClusterTableInstanceColumnName is the `INSTANCE` column name of the cluster table.
+	ClusterTableInstanceColumnName = "INSTANCE"
 )
 
 // IsMemOrSysDB uses to check whether dbLowerName is memory database or system database.
 func IsMemOrSysDB(dbLowerName string) bool {
+	return IsMemDB(dbLowerName) || IsSysDB(dbLowerName)
+}
+
+// IsMemDB checks whether dbLowerName is memory database.
+func IsMemDB(dbLowerName string) bool {
 	switch dbLowerName {
 	case InformationSchemaName.L,
 		PerformanceSchemaName.L,
-		mysql.SystemDB,
+		MetricSchemaName.L:
+		return true
+	}
+	return false
+}
+
+// IsSysDB checks whether dbLowerName is system database.
+func IsSysDB(dbLowerName string) bool {
+	return dbLowerName == mysql.SystemDB
+}
+
+// IsSystemView is similar to IsMemOrSyDB, but does not include the mysql schema
+func IsSystemView(dbLowerName string) bool {
+	switch dbLowerName {
+	case InformationSchemaName.L,
+		PerformanceSchemaName.L,
 		MetricSchemaName.L:
 		return true
 	}
@@ -234,6 +275,42 @@ func MockPkixAttribute(name, value string) pkix.AttributeTypeAndValue {
 		Type:  vs,
 		Value: value,
 	}
+}
+
+// SANType is enum value for GlobalPrivValue.SANs keys.
+type SANType string
+
+const (
+	// URI indicates uri info in SAN.
+	URI = SANType("URI")
+	// DNS indicates dns info in SAN.
+	DNS = SANType("DNS")
+	// IP indicates ip info in SAN.
+	IP = SANType("IP")
+)
+
+var supportSAN = map[SANType]struct{}{
+	URI: {},
+	DNS: {},
+	IP:  {},
+}
+
+// ParseAndCheckSAN parses and check SAN str.
+func ParseAndCheckSAN(san string) (map[SANType][]string, error) {
+	sanMap := make(map[SANType][]string)
+	sans := strings.Split(san, ",")
+	for _, san := range sans {
+		kv := strings.SplitN(san, ":", 2)
+		if len(kv) != 2 {
+			return nil, errors.Errorf("invalid SAN value %s", san)
+		}
+		k, v := SANType(strings.ToUpper(strings.TrimSpace(kv[0]))), strings.TrimSpace(kv[1])
+		if _, s := supportSAN[k]; !s {
+			return nil, errors.Errorf("unsupported SAN key %s, current only support %v", k, supportSAN)
+		}
+		sanMap[k] = append(sanMap[k], v)
+	}
+	return sanMap, nil
 }
 
 // CheckSupportX509NameOneline parses and validate input str is X509_NAME_oneline format
@@ -347,7 +424,8 @@ type SequenceSchema interface {
 	SequenceByName(schema, sequence model.CIStr) (SequenceTable, error)
 }
 
-// SequenceTable is implemented by tableCommon, and it is specialised in handling sequence operation.
+// SequenceTable is implemented by tableCommon,
+// and it is specialised in handling sequence operation.
 // Otherwise calling table will cause import cycle problem.
 type SequenceTable interface {
 	GetSequenceID() int64
@@ -379,7 +457,7 @@ func LoadTLSCertificates(ca, key, cert string) (tlsConfig *tls.Config, err error
 	var certPool *x509.CertPool
 	if len(ca) > 0 {
 		var caCert []byte
-		caCert, err = ioutil.ReadFile(ca)
+		caCert, err = os.ReadFile(ca)
 		if err != nil {
 			logutil.BgLogger().Warn("read file failed", zap.Error(err))
 			err = errors.Trace(err)
@@ -430,7 +508,8 @@ func InternalHTTPSchema() string {
 }
 
 func initInternalClient() {
-	tlsCfg, err := config.GetGlobalConfig().Security.ToTLSConfig()
+	clusterSecurity := config.GetGlobalConfig().Security.ClusterSecurity()
+	tlsCfg, err := clusterSecurity.ToTLSConfig()
 	if err != nil {
 		logutil.BgLogger().Fatal("could not load cluster ssl", zap.Error(err))
 	}
@@ -443,4 +522,27 @@ func initInternalClient() {
 	internalHTTPClient = &http.Client{
 		Transport: &http.Transport{TLSClientConfig: tlsCfg},
 	}
+}
+
+// GetLocalIP will return a local IP(non-loopback, non 0.0.0.0), if there is one
+func GetLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, address := range addrs {
+			ipnet, ok := address.(*net.IPNet)
+			if ok && ipnet.IP.IsGlobalUnicast() {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return ""
+}
+
+// QueryStrForLog trim the query if the query length more than 4096
+func QueryStrForLog(query string) string {
+	const size = 4096
+	if len(query) > size {
+		return query[:size] + fmt.Sprintf("(len: %d)", len(query))
+	}
+	return query
 }

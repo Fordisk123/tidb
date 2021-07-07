@@ -62,3 +62,24 @@ func GetInt64(ctx context.Context, r Retriever, k Key) (int64, error) {
 	}
 	return intVal, nil
 }
+
+// WalkMemBuffer iterates all buffered kv pairs in memBuf
+func WalkMemBuffer(memBuf Retriever, f func(k Key, v []byte) error) error {
+	iter, err := memBuf.Iter(nil, nil)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	defer iter.Close()
+	for iter.Valid() {
+		if err = f(iter.Key(), iter.Value()); err != nil {
+			return errors.Trace(err)
+		}
+		err = iter.Next()
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	return nil
+}

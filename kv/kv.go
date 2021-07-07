@@ -15,52 +15,17 @@ package kv
 
 import (
 	"context"
-	"sync"
+	"crypto/tls"
 	"time"
 
+	deadlockpb "github.com/pingcap/kvproto/pkg/deadlock"
+	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/config"
-	"github.com/pingcap/tidb/store/tikv/oracle"
-	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/memory"
-)
-
-// Transaction options
-const (
-	// PresumeKeyNotExists indicates that when dealing with a Get operation but failing to read data from cache,
-	// we presume that the key does not exist in Store. The actual existence will be checked before the
-	// transaction's commit.
-	// This option is an optimization for frequent checks during a transaction, e.g. batch inserts.
-	PresumeKeyNotExists Option = iota + 1
-	// PresumeKeyNotExistsError is the option key for error.
-	// When PresumeKeyNotExists is set and condition is not match, should throw the error.
-	PresumeKeyNotExistsError
-	// BinlogInfo contains the binlog data and client.
-	BinlogInfo
-	// SchemaChecker is used for checking schema-validity.
-	SchemaChecker
-	// IsolationLevel sets isolation level for current transaction. The default level is SI.
-	IsolationLevel
-	// Priority marks the priority of this transaction.
-	Priority
-	// NotFillCache makes this request do not touch the LRU cache of the underlying storage.
-	NotFillCache
-	// SyncLog decides whether the WAL(write-ahead log) of this request should be synchronized.
-	SyncLog
-	// KeyOnly retrieve only keys, it can be used in scan now.
-	KeyOnly
-	// Pessimistic is defined for pessimistic lock
-	Pessimistic
-	// SnapshotTS is defined to set snapshot ts.
-	SnapshotTS
-	// Set replica read
-	ReplicaRead
-)
-
-// Priority value for transaction priority.
-const (
-	PriorityNormal = iota
-	PriorityLow
-	PriorityHigh
+	tikvstore "github.com/tikv/client-go/v2/kv"
+	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/tikv"
 )
 
 // UnCommitIndexKVFlag uses to indicate the index key/value is no need to commit.
@@ -72,42 +37,10 @@ const (
 // Append UnCommitIndexKVFlag to the value indicate the index key/value is no need to commit.
 const UnCommitIndexKVFlag byte = '1'
 
-// MaxTxnTimeUse is the max time a Txn may use (in ms) from its begin to commit.
-// We use it to abort the transaction to guarantee GC worker will not influence it.
-const MaxTxnTimeUse = 24 * 60 * 60 * 1000
-
-// IsoLevel is the transaction's isolation level.
-type IsoLevel int
-
-const (
-	// SI stands for 'snapshot isolation'.
-	SI IsoLevel = iota
-	// RC stands for 'read committed'.
-	RC
-)
-
-// ReplicaReadType is the type of replica to read data from
-type ReplicaReadType byte
-
-const (
-	// ReplicaReadLeader stands for 'read from leader'.
-	ReplicaReadLeader ReplicaReadType = 1 << iota
-	// ReplicaReadFollower stands for 'read from follower'.
-	ReplicaReadFollower
-	// ReplicaReadMixed stands for 'read from leader and follower and learner'.
-	ReplicaReadMixed
-)
-
-// IsFollowerRead checks if leader is going to be used to read data.
-func (r ReplicaReadType) IsFollowerRead() bool {
-	// In some cases the default value is 0, which should be treated as `ReplicaReadLeader`.
-	return r != ReplicaReadLeader && r != 0
-}
-
 // Those limits is enforced to make sure the transaction can be well handled by TiKV.
 var (
 	// TxnEntrySizeLimit is limit of single entry size (len(key) + len(value)).
-	TxnEntrySizeLimit = 6 * 1024 * 1024
+	TxnEntrySizeLimit uint64 = config.DefTxnEntrySizeLimit
 	// TxnTotalSizeLimit is limit of the sum of all entry size.
 	TxnTotalSizeLimit uint64 = config.DefTxnTotalSizeLimit
 )
@@ -144,6 +77,16 @@ type Mutator interface {
 	Delete(k Key) error
 }
 
+// StagingHandle is the reference of a staging buffer.
+type StagingHandle int
+
+var (
+	// InvalidStagingHandle is an invalid handler, MemBuffer will check handler to ensure safety.
+	InvalidStagingHandle StagingHandle = 0
+	// LastActiveStagingHandle is an special handler which always point to the last active staging buffer.
+	LastActiveStagingHandle StagingHandle = -1
+)
+
 // RetrieverMutator is the interface that groups Retriever and Mutator interfaces.
 type RetrieverMutator interface {
 	Retriever
@@ -153,21 +96,56 @@ type RetrieverMutator interface {
 // MemBuffer is an in-memory kv collection, can be used to buffer write operations.
 type MemBuffer interface {
 	RetrieverMutator
-	// Size returns sum of keys and values length.
-	Size() int
+
+	// RLock locks the MemBuffer for shared read.
+	// In the most case, MemBuffer will only used by single goroutine,
+	// but it will be read by multiple goroutine when combined with executor.UnionScanExec.
+	// To avoid race introduced by executor.UnionScanExec, MemBuffer expose read lock for it.
+	RLock()
+	// RUnlock unlocks the MemBuffer.
+	RUnlock()
+
+	// GetFlags returns the latest flags associated with key.
+	GetFlags(Key) (KeyFlags, error)
+	// SetWithFlags put key-value into the last active staging buffer with the given KeyFlags.
+	SetWithFlags(Key, []byte, ...FlagsOp) error
+	// DeleteWithFlags delete key with the given KeyFlags
+	DeleteWithFlags(Key, ...FlagsOp) error
+
+	// Staging create a new staging buffer inside the MemBuffer.
+	// Subsequent writes will be temporarily stored in this new staging buffer.
+	// When you think all modifications looks good, you can call `Release` to public all of them to the upper level buffer.
+	Staging() StagingHandle
+	// Release publish all modifications in the latest staging buffer to upper level.
+	Release(StagingHandle)
+	// Cleanup cleanup the resources referenced by the StagingHandle.
+	// If the changes are not published by `Release`, they will be discarded.
+	Cleanup(StagingHandle)
+	// InspectStage used to inspect the value updates in the given stage.
+	InspectStage(StagingHandle, func(Key, KeyFlags, []byte))
+
+	// SnapshotGetter returns a Getter for a snapshot of MemBuffer.
+	SnapshotGetter() Getter
+	// SnapshotIter returns a Iterator for a snapshot of MemBuffer.
+	SnapshotIter(k, upperbound Key) Iterator
+
 	// Len returns the number of entries in the DB.
 	Len() int
-	// Reset cleanup the MemBuffer
-	Reset()
-	// SetCap sets the MemBuffer capability, to reduce memory allocations.
-	// Please call it before you use the MemBuffer, otherwise it will not works.
-	SetCap(cap int)
 }
+
+// LockCtx contains information for LockKeys method.
+type LockCtx = tikvstore.LockCtx
 
 // Transaction defines the interface for operations inside a Transaction.
 // This is not thread safe.
 type Transaction interface {
-	MemBuffer
+	RetrieverMutator
+	// Size returns sum of keys and values length.
+	Size() int
+	// Len returns the number of entries in the DB.
+	Len() int
+	// Reset reset the Transaction to initial states.
+	Reset()
 	// Commit commits the transaction operations to KV store.
 	Commit(context.Context) error
 	// Rollback undoes the transaction operations to KV store.
@@ -175,12 +153,13 @@ type Transaction interface {
 	// String implements fmt.Stringer interface.
 	String() string
 	// LockKeys tries to lock the entries with the keys in KV store.
+	// Will block until all keys are locked successfully or an error occurs.
 	LockKeys(ctx context.Context, lockCtx *LockCtx, keys ...Key) error
 	// SetOption sets an option with a value, when val is nil, uses the default
 	// value of this option.
-	SetOption(opt Option, val interface{})
-	// DelOption deletes an option.
-	DelOption(opt Option)
+	SetOption(opt int, val interface{})
+	// GetOption returns the option
+	GetOption(opt int) interface{}
 	// IsReadOnly checks if the transaction has only performed read operations.
 	IsReadOnly() bool
 	// StartTS returns the transaction start timestamp.
@@ -193,38 +172,26 @@ type Transaction interface {
 	// GetSnapshot returns the Snapshot binding to this transaction.
 	GetSnapshot() Snapshot
 	// SetVars sets variables to the transaction.
-	SetVars(vars *Variables)
+	SetVars(vars interface{})
+	// GetVars gets variables from the transaction.
+	GetVars() interface{}
 	// BatchGet gets kv from the memory buffer of statement and transaction, and the kv storage.
 	// Do not use len(value) == 0 or value == nil to represent non-exist.
 	// If a key doesn't exist, there shouldn't be any corresponding entry in the result map.
 	BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error)
 	IsPessimistic() bool
-}
-
-// LockCtx contains information for LockKeys method.
-type LockCtx struct {
-	Killed                *uint32
-	ForUpdateTS           uint64
-	LockWaitTime          int64
-	WaitStartTime         time.Time
-	PessimisticLockWaited *int32
-	LockKeysDuration      *time.Duration
-	LockKeysCount         *int32
-	ReturnValues          bool
-	Values                map[string]ReturnedValue
-	ValuesLock            sync.Mutex
-}
-
-// ReturnedValue pairs the Value and AlreadyLocked flag for PessimisticLock return values result.
-type ReturnedValue struct {
-	Value         []byte
-	AlreadyLocked bool
+	// CacheIndexName caches the index name.
+	// PresumeKeyNotExists will use this to help decode error message.
+	CacheTableInfo(id int64, info *model.TableInfo)
+	// GetIndexName returns the cached index name.
+	// If there is no such index already inserted through CacheIndexName, it will return UNKNOWN.
+	GetTableInfo(id int64) *model.TableInfo
 }
 
 // Client is used to send request to KV layer.
 type Client interface {
 	// Send sends request to KV layer, returns a Response.
-	Send(ctx context.Context, req *Request, vars *Variables) Response
+	Send(ctx context.Context, req *Request, vars interface{}, sessionMemTracker *memory.Tracker, enabledRateLimitAction bool) Response
 
 	// IsRequestTypeSupported checks if reqType and subType is supported.
 	IsRequestTypeSupported(reqType, subType int64) bool
@@ -310,6 +277,20 @@ type Request struct {
 	Cacheable bool
 	// SchemaVer is for any schema-ful storage to validate schema correctness if necessary.
 	SchemaVar int64
+	// BatchCop indicates whether send batch coprocessor request to tiflash.
+	BatchCop bool
+	// TaskID is an unique ID for an execution of a statement
+	TaskID uint64
+	// TiDBServerID is the specified TiDB serverID to execute request. `0` means all TiDB instances.
+	TiDBServerID uint64
+	// TxnScope is the scope of the current txn.
+	TxnScope string
+	// IsStaleness indicates whether the request read staleness data
+	IsStaleness bool
+	// MatchStoreLabels indicates the labels the store should be matched
+	MatchStoreLabels []*metapb.StoreLabel
+	// ResourceGroupTag indicates the kv request task group.
+	ResourceGroupTag []byte
 }
 
 // ResultSubset represents a result subset from a single storage unit.
@@ -319,8 +300,6 @@ type ResultSubset interface {
 	GetData() []byte
 	// GetStartKey gets the start key.
 	GetStartKey() Key
-	// GetExecDetails gets the detail information.
-	GetExecDetails() *execdetails.ExecDetails
 	// MemSize returns how many bytes of memory this result use for tracing memory usage.
 	MemSize() int64
 	// RespTime returns the response time for the request.
@@ -343,9 +322,7 @@ type Snapshot interface {
 	BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error)
 	// SetOption sets an option with a value, when val is nil, uses the default
 	// value of this option. Only ReplicaRead is supported for snapshot
-	SetOption(opt Option, val interface{})
-	// DelOption deletes an option.
-	DelOption(opt Option)
+	SetOption(opt int, val interface{})
 }
 
 // BatchGetter is the interface for BatchGet.
@@ -364,21 +341,23 @@ type Driver interface {
 // Storage defines the interface for storage.
 // Isolation should be at least SI(SNAPSHOT ISOLATION)
 type Storage interface {
-	// Begin transaction
+	// Begin a global transaction
 	Begin() (Transaction, error)
-	// BeginWithStartTS begins transaction with startTS.
-	BeginWithStartTS(startTS uint64) (Transaction, error)
+	// BeginWithOption begins a transaction with given option
+	BeginWithOption(option tikv.StartTSOption) (Transaction, error)
 	// GetSnapshot gets a snapshot that is able to read any data which data is <= ver.
 	// if ver is MaxVersion or > current max committed version, we will use current version for this snapshot.
-	GetSnapshot(ver Version) (Snapshot, error)
+	GetSnapshot(ver Version) Snapshot
 	// GetClient gets a client instance.
 	GetClient() Client
+	// GetMPPClient gets a mpp client instance.
+	GetMPPClient() MPPClient
 	// Close store
 	Close() error
 	// UUID return a unique ID which represents a Storage.
 	UUID() string
-	// CurrentVersion returns current max committed version.
-	CurrentVersion() (Version, error)
+	// CurrentVersion returns current max committed version with the given txnScope (local or global).
+	CurrentVersion(txnScope string) (Version, error)
 	// GetOracle gets a timestamp oracle client.
 	GetOracle() oracle.Oracle
 	// SupportDeleteRange gets the storage support delete range or not.
@@ -389,6 +368,19 @@ type Storage interface {
 	Describe() string
 	// ShowStatus returns the specified status of the storage
 	ShowStatus(ctx context.Context, key string) (interface{}, error)
+	// GetMemCache return memory manager of the storage.
+	GetMemCache() MemManager
+	// GetMinSafeTS return the minimal SafeTS of the storage with given txnScope.
+	GetMinSafeTS(txnScope string) uint64
+	// GetLockWaits return all lock wait information
+	GetLockWaits() ([]*deadlockpb.WaitForEntry, error)
+}
+
+// EtcdBackend is used for judging a storage is a real TiKV.
+type EtcdBackend interface {
+	EtcdAddrs() ([]string, error)
+	TLSConfig() *tls.Config
+	StartGCWorker() error
 }
 
 // FnKeyCmp is the function for iterator the keys
@@ -405,15 +397,24 @@ type Iterator interface {
 
 // SplittableStore is the kv store which supports split regions.
 type SplittableStore interface {
-	SplitRegions(ctx context.Context, splitKey [][]byte, scatter bool) (regionID []uint64, err error)
-	WaitScatterRegionFinish(regionID uint64, backOff int) error
+	SplitRegions(ctx context.Context, splitKey [][]byte, scatter bool, tableID *int64) (regionID []uint64, err error)
+	WaitScatterRegionFinish(ctx context.Context, regionID uint64, backOff int) error
 	CheckRegionInScattering(regionID uint64) (bool, error)
 }
 
-// Used for pessimistic lock wait time
-// these two constants are special for lock protocol with tikv
-// 0 means always wait, -1 means nowait, others meaning lock wait in milliseconds
-var (
-	LockAlwaysWait = int64(0)
-	LockNoWait     = int64(-1)
+// Priority value for transaction priority.
+const (
+	PriorityNormal = iota
+	PriorityLow
+	PriorityHigh
+)
+
+// IsoLevel is the transaction's isolation level.
+type IsoLevel int
+
+const (
+	// SI stands for 'snapshot isolation'.
+	SI IsoLevel = iota
+	// RC stands for 'read committed'.
+	RC
 )

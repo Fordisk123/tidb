@@ -19,9 +19,11 @@ import (
 
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/domain/infosync"
+	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/sem"
 )
 
 // Cluster table list, attention:
@@ -30,17 +32,32 @@ import (
 const (
 	// ClusterTableSlowLog is the string constant of cluster slow query memory table.
 	ClusterTableSlowLog     = "CLUSTER_SLOW_QUERY"
-	clusterTableProcesslist = "CLUSTER_PROCESSLIST"
+	ClusterTableProcesslist = "CLUSTER_PROCESSLIST"
+	// ClusterTableStatementsSummary is the string constant of cluster statement summary table.
+	ClusterTableStatementsSummary = "CLUSTER_STATEMENTS_SUMMARY"
+	// ClusterTableStatementsSummaryHistory is the string constant of cluster statement summary history table.
+	ClusterTableStatementsSummaryHistory = "CLUSTER_STATEMENTS_SUMMARY_HISTORY"
+	// ClusterTableStatementsSummaryEvicted is the string constant of cluster statement summary evict table.
+	ClusterTableStatementsSummaryEvicted = "CLUSTER_STATEMENTS_SUMMARY_EVICTED"
+	// ClusterTableTiDBTrx is the string constant of cluster transaction running table.
+	ClusterTableTiDBTrx = "CLUSTER_TIDB_TRX"
+	// ClusterTableDeadlocks is the string constant of cluster dead lock table.
+	ClusterTableDeadlocks = "CLUSTER_DEADLOCKS"
 )
 
 // memTableToClusterTables means add memory table to cluster table.
 var memTableToClusterTables = map[string]string{
-	TableSlowQuery:   ClusterTableSlowLog,
-	tableProcesslist: clusterTableProcesslist,
+	TableSlowQuery:                ClusterTableSlowLog,
+	TableProcesslist:              ClusterTableProcesslist,
+	TableStatementsSummary:        ClusterTableStatementsSummary,
+	TableStatementsSummaryHistory: ClusterTableStatementsSummaryHistory,
+	TableStatementsSummaryEvicted: ClusterTableStatementsSummaryEvicted,
+	TableTiDBTrx:                  ClusterTableTiDBTrx,
+	TableDeadlocks:                ClusterTableDeadlocks,
 }
 
 func init() {
-	var addrCol = columnInfo{name: "INSTANCE", tp: mysql.TypeVarchar, size: 64}
+	var addrCol = columnInfo{name: util.ClusterTableInstanceColumnName, tp: mysql.TypeVarchar, size: 64}
 	for memTableName, clusterMemTableName := range memTableToClusterTables {
 		memTableCols := tableNameToColumns[memTableName]
 		if len(memTableCols) == 0 {
@@ -72,18 +89,12 @@ func isClusterTableByName(dbName, tableName string) bool {
 	return false
 }
 
-func dataForClusterProcesslist(ctx sessionctx.Context) (rows [][]types.Datum, err error) {
-	rows = dataForProcesslist(ctx)
-	return AppendHostInfoToRows(rows)
-}
-
 // AppendHostInfoToRows appends host info to the rows.
-func AppendHostInfoToRows(rows [][]types.Datum) ([][]types.Datum, error) {
-	serverInfo, err := infosync.GetServerInfo()
+func AppendHostInfoToRows(ctx sessionctx.Context, rows [][]types.Datum) ([][]types.Datum, error) {
+	addr, err := GetInstanceAddr(ctx)
 	if err != nil {
 		return nil, err
 	}
-	addr := serverInfo.IP + ":" + strconv.FormatUint(uint64(serverInfo.StatusPort), 10)
 	for i := range rows {
 		row := make([]types.Datum, 0, len(rows[i])+1)
 		row = append(row, types.NewStringDatum(addr))
@@ -91,4 +102,20 @@ func AppendHostInfoToRows(rows [][]types.Datum) ([][]types.Datum, error) {
 		rows[i] = row
 	}
 	return rows, nil
+}
+
+// GetInstanceAddr gets the instance address.
+func GetInstanceAddr(ctx sessionctx.Context) (string, error) {
+	serverInfo, err := infosync.GetServerInfo()
+	if err != nil {
+		return "", err
+	}
+	addr := serverInfo.IP + ":" + strconv.FormatUint(uint64(serverInfo.StatusPort), 10)
+	if sem.IsEnabled() {
+		checker := privilege.GetPrivilegeManager(ctx)
+		if checker == nil || !checker.RequestDynamicVerification(ctx.GetSessionVars().ActiveRoles, "RESTRICTED_TABLES_ADMIN", false) {
+			addr = serverInfo.ID
+		}
+	}
+	return addr, nil
 }

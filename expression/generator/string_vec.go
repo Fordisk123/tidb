@@ -19,8 +19,8 @@ import (
 	"bytes"
 	"flag"
 	"go/format"
-	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
 	"text/template"
 
@@ -93,7 +93,11 @@ func (b *builtinField{{ .TypeName }}Sig) vecEvalInt(input *chunk.Chunk, result *
 {{ if .Fixed }}
 			if arg0[j] == arg1[j] {
 {{ else }}
+	{{ if eq .TypeName "String" }}
+			if b.ctor.Compare(buf0.GetString(j), buf1.GetString(j)) == 0 {
+	{{ else }}
 			if buf0.Get{{ .TypeName }}(j) == buf1.Get{{ .TypeName }}(j) {
+	{{ end }}
 {{ end }}
 				i64s[j] = int64(i)
 			}
@@ -164,7 +168,7 @@ func generateDotGo(fileName string, types []TypeContext) (err error) {
 		log.Println("[Warn]", fileName+": gofmt failed", err)
 		data = w.Bytes() // write original data for debugging
 	}
-	return ioutil.WriteFile(fileName, data, 0644)
+	return os.WriteFile(fileName, data, 0644)
 }
 
 func generateTestDotGo(fileName string, types []TypeContext) error {
@@ -182,7 +186,7 @@ func generateTestDotGo(fileName string, types []TypeContext) error {
 		log.Println("[Warn]", fileName+": gofmt failed", err)
 		data = w.Bytes() // write original data for debugging
 	}
-	return ioutil.WriteFile(fileName, data, 0644)
+	return os.WriteFile(fileName, data, 0644)
 }
 
 // generateOneFile generate one xxx.go file and the associated xxx_test.go file.

@@ -26,6 +26,7 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/mock"
 )
 
 func (s *testEvaluatorSuite) TestCastXXX(c *C) {
@@ -167,7 +168,7 @@ func (s *testEvaluatorSuite) TestCastXXX(c *C) {
 
 	// cast('18446744073709551616' as signed);
 	mask := ^mysql.UnsignedFlag
-	tp1.Flag &= uint(mask)
+	tp1.Flag &= mask
 	f = BuildCastFunction(ctx, &Constant{Value: types.NewDatum("18446744073709551616"), RetType: types.NewFieldType(mysql.TypeString)}, tp1)
 	res, err = f.Eval(chunk.Row{})
 	c.Assert(err, IsNil)
@@ -222,7 +223,8 @@ func (s *testEvaluatorSuite) TestCastXXX(c *C) {
 	res, err = f.Eval(chunk.Row{})
 	c.Assert(err, IsNil)
 	resDecimal := new(types.MyDecimal)
-	resDecimal.FromString([]byte("99999.99"))
+	err = resDecimal.FromString([]byte("99999.99"))
+	c.Assert(err, IsNil)
 	c.Assert(res.GetMysqlDecimal().Compare(resDecimal), Equals, 0)
 
 	warnings = sc.GetWarnings()
@@ -252,7 +254,7 @@ func (s *testEvaluatorSuite) TestCastXXX(c *C) {
 
 	// cast(bad_string as decimal)
 	for _, s := range []string{"hello", ""} {
-		f = BuildCastFunction(ctx, &Constant{Value: types.NewDatum(s), RetType: types.NewFieldType(mysql.TypeDecimal)}, tp)
+		f = BuildCastFunction(ctx, &Constant{Value: types.NewDatum(s), RetType: types.NewFieldType(mysql.TypeNewDecimal)}, tp)
 		res, err = f.Eval(chunk.Row{})
 		c.Assert(err, IsNil)
 	}
@@ -270,7 +272,7 @@ func (s *testEvaluatorSuite) TestCastXXX(c *C) {
 var (
 	year, month, day     = time.Now().In(time.UTC).Date()
 	curDateInt           = int64(year*10000 + int(month)*100 + day)
-	curTimeInt           = int64(curDateInt*1000000 + 125959)
+	curTimeInt           = curDateInt*1000000 + 125959
 	curTimeWithFspReal   = float64(curTimeInt) + 0.555
 	curTimeString        = fmt.Sprintf("%4d-%02d-%02d 12:59:59", year, int(month), day)
 	curTimeWithFspString = fmt.Sprintf("%4d-%02d-%02d 12:59:59.555000", year, int(month), day)
@@ -281,12 +283,12 @@ var (
 	// timeWithFspDatum indicates datetime "curYear-curMonth-curDay 12:59:59.555000".
 	timeWithFspDatum = types.NewDatum(tmWithFsp)
 	duration         = types.Duration{
-		Duration: time.Duration(12*time.Hour + 59*time.Minute + 59*time.Second),
+		Duration: 12*time.Hour + 59*time.Minute + 59*time.Second,
 		Fsp:      types.DefaultFsp}
 	// durationDatum indicates duration "12:59:59".
 	durationDatum   = types.NewDatum(duration)
 	durationWithFsp = types.Duration{
-		Duration: time.Duration(12*time.Hour + 59*time.Minute + 59*time.Second + 555*time.Millisecond),
+		Duration: 12*time.Hour + 59*time.Minute + 59*time.Second + 555*time.Millisecond,
 		Fsp:      3}
 	// durationWithFspDatum indicates duration "12:59:59.555"
 	durationWithFspDatum = types.NewDatum(durationWithFsp)
@@ -355,7 +357,9 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 	}
 	for i, t := range castToDecCases {
 		args := []Expression{t.before}
-		decFunc := newBaseBuiltinCastFunc(newBaseBuiltinFunc(ctx, args), false)
+		b, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
+		decFunc := newBaseBuiltinCastFunc(b, false)
 		decFunc.tp = types.NewFieldType(mysql.TypeNewDecimal)
 		switch i {
 		case 0:
@@ -439,7 +443,9 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		args := []Expression{t.before}
 		tp := types.NewFieldType(mysql.TypeNewDecimal)
 		tp.Flen, tp.Decimal = t.flen, t.decimal
-		decFunc := newBaseBuiltinCastFunc(newBaseBuiltinFunc(ctx, args), false)
+		b, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
+		decFunc := newBaseBuiltinCastFunc(b, false)
 		decFunc.tp = tp
 		switch i {
 		case 0:
@@ -483,8 +489,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		// cast real as int.
 		{
 			&Column{RetType: types.NewFieldType(mysql.TypeDouble), Index: 0},
-			1,
-			chunk.MutRowFromDatums([]types.Datum{types.NewFloat64Datum(1)}),
+			2,
+			chunk.MutRowFromDatums([]types.Datum{types.NewFloat64Datum(2.5)}),
 		},
 		// cast Time as int.
 		{
@@ -507,7 +513,9 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 	}
 	for i, t := range castToIntCases {
 		args := []Expression{t.before}
-		intFunc := newBaseBuiltinCastFunc(newBaseBuiltinFunc(ctx, args), false)
+		b, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
+		intFunc := newBaseBuiltinCastFunc(b, false)
 		switch i {
 		case 0:
 			sig = &builtinCastStringAsIntSig{intFunc}
@@ -573,7 +581,9 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 	}
 	for i, t := range castToRealCases {
 		args := []Expression{t.before}
-		realFunc := newBaseBuiltinCastFunc(newBaseBuiltinFunc(ctx, args), false)
+		b, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
+		realFunc := newBaseBuiltinCastFunc(b, false)
 		switch i {
 		case 0:
 			sig = &builtinCastStringAsRealSig{realFunc}
@@ -647,7 +657,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		tp := types.NewFieldType(mysql.TypeVarString)
 		tp.Charset = charset.CharsetBin
 		args := []Expression{t.before}
-		stringFunc := newBaseBuiltinFunc(ctx, args)
+		stringFunc, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
 		stringFunc.tp = tp
 		switch i {
 		case 0:
@@ -725,7 +736,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		args := []Expression{t.before}
 		tp := types.NewFieldType(mysql.TypeVarString)
 		tp.Flen, tp.Charset = t.flen, charset.CharsetBin
-		stringFunc := newBaseBuiltinFunc(ctx, args)
+		stringFunc, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
 		stringFunc.tp = tp
 		switch i {
 		case 0:
@@ -800,7 +812,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		args := []Expression{t.before}
 		tp := types.NewFieldType(mysql.TypeDatetime)
 		tp.Decimal = int(types.DefaultFsp)
-		timeFunc := newBaseBuiltinFunc(ctx, args)
+		timeFunc, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
 		timeFunc.tp = tp
 		switch i {
 		case 0:
@@ -884,7 +897,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		args := []Expression{t.before}
 		tp := types.NewFieldType(t.tp)
 		tp.Decimal = int(t.fsp)
-		timeFunc := newBaseBuiltinFunc(ctx, args)
+		timeFunc, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
 		timeFunc.tp = tp
 		switch i {
 		case 0:
@@ -965,7 +979,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		args := []Expression{t.before}
 		tp := types.NewFieldType(mysql.TypeDuration)
 		tp.Decimal = int(types.DefaultFsp)
-		durationFunc := newBaseBuiltinFunc(ctx, args)
+		durationFunc, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
 		durationFunc.tp = tp
 		switch i {
 		case 0:
@@ -1042,7 +1057,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 		args := []Expression{t.before}
 		tp := types.NewFieldType(mysql.TypeDuration)
 		tp.Decimal = t.fsp
-		durationFunc := newBaseBuiltinFunc(ctx, args)
+		durationFunc, err := newBaseBuiltinFunc(ctx, "", args, 0)
+		c.Assert(err, IsNil)
 		durationFunc.tp = tp
 		switch i {
 		case 0:
@@ -1074,7 +1090,8 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 	// null case
 	args := []Expression{&Column{RetType: types.NewFieldType(mysql.TypeDouble), Index: 0}}
 	row := chunk.MutRowFromDatums([]types.Datum{types.NewDatum(nil)})
-	bf := newBaseBuiltinFunc(ctx, args)
+	bf, err := newBaseBuiltinFunc(ctx, "", args, 0)
+	c.Assert(err, IsNil)
 	bf.tp = types.NewFieldType(mysql.TypeVarString)
 	sig = &builtinCastRealAsStringSig{bf}
 	sRes, isNull, err := sig.evalString(row.ToRow())
@@ -1084,7 +1101,9 @@ func (s *testEvaluatorSuite) TestCastFuncSig(c *C) {
 
 	// test hybridType case.
 	args = []Expression{&Constant{Value: types.NewDatum(types.Enum{Name: "a", Value: 0}), RetType: types.NewFieldType(mysql.TypeEnum)}}
-	sig = &builtinCastStringAsIntSig{newBaseBuiltinCastFunc(newBaseBuiltinFunc(ctx, args), false)}
+	b, err := newBaseBuiltinFunc(ctx, "", args, 0)
+	c.Assert(err, IsNil)
+	sig = &builtinCastStringAsIntSig{newBaseBuiltinCastFunc(b, false)}
 	iRes, isNull, err := sig.evalInt(chunk.Row{})
 	c.Assert(isNull, Equals, false)
 	c.Assert(err, IsNil)
@@ -1100,7 +1119,9 @@ func (s *testEvaluatorSuite) TestCastJSONAsDecimalSig(c *C) {
 	}()
 
 	col := &Column{RetType: types.NewFieldType(mysql.TypeJSON), Index: 0}
-	decFunc := newBaseBuiltinCastFunc(newBaseBuiltinFunc(ctx, []Expression{col}), false)
+	b, err := newBaseBuiltinFunc(ctx, "", []Expression{col}, 0)
+	c.Assert(err, IsNil)
+	decFunc := newBaseBuiltinCastFunc(b, false)
 	decFunc.tp = types.NewFieldType(mysql.TypeNewDecimal)
 	decFunc.tp.Flen = 60
 	decFunc.tp.Decimal = 2
@@ -1187,7 +1208,7 @@ func (s *testEvaluatorSuite) TestWrapWithCastAsTypesClasses(c *C) {
 		{
 			&Column{RetType: types.NewFieldType(mysql.TypeDatetime), Index: 0},
 			chunk.MutRowFromDatums([]types.Datum{timeWithFspDatum}),
-			int64(curDateInt*1000000 + 130000), curTimeWithFspReal, types.NewDecFromFloatForTest(curTimeWithFspReal), curTimeWithFspString,
+			curDateInt*1000000 + 130000, curTimeWithFspReal, types.NewDecFromFloatForTest(curTimeWithFspReal), curTimeWithFspString,
 		},
 		{
 			durationColumn0,
@@ -1394,5 +1415,41 @@ func (s *testEvaluatorSuite) TestCastIntAsIntVec(c *C) {
 		c.Assert(err, IsNil)
 		c.Assert(v, Equals, i64s[i])
 		i++
+	}
+}
+
+// for issue https://github.com/pingcap/tidb/issues/16825
+func (s *testEvaluatorSuite) TestCastStringAsDecimalSigWithUnsignedFlagInUnion(c *C) {
+	col := &Column{RetType: types.NewFieldType(mysql.TypeString), Index: 0}
+	b, err := newBaseBuiltinFunc(mock.NewContext(), "", []Expression{col}, 0)
+	c.Assert(err, IsNil)
+	// set `inUnion` to `true`
+	decFunc := newBaseBuiltinCastFunc(b, true)
+	decFunc.tp = types.NewFieldType(mysql.TypeNewDecimal)
+	// set the `UnsignedFlag` bit
+	decFunc.tp.Flag |= mysql.UnsignedFlag
+	cast := &builtinCastStringAsDecimalSig{decFunc}
+
+	cases := []struct {
+		row chunk.MutRow
+		res *types.MyDecimal
+	}{
+		// if `inUnion` is `true`, the result of cast a positive decimal string to unsigned decimal should be normal
+		{
+			chunk.MutRowFromDatums([]types.Datum{types.NewStringDatum("1")}),
+			types.NewDecFromInt(1),
+		},
+		// if `inUnion` is `true`, the result of cast a negative decimal string to unsigned decimal should be 0
+		{
+			chunk.MutRowFromDatums([]types.Datum{types.NewStringDatum("-1")}),
+			types.NewDecFromInt(0),
+		},
+	}
+
+	for _, t := range cases {
+		res, isNull, err := cast.evalDecimal(t.row.ToRow())
+		c.Assert(isNull, Equals, false)
+		c.Assert(err, IsNil)
+		c.Assert(res.Compare(t.res), Equals, 0)
 	}
 }

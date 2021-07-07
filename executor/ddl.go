@@ -22,14 +22,17 @@ import (
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/util/admin"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/gcutil"
@@ -58,7 +61,7 @@ func (e *DDLExec) toErr(err error) error {
 		logutil.BgLogger().Error("active txn failed", zap.Error(err))
 		return err1
 	}
-	schemaInfoErr := checker.Check(txn.StartTS())
+	_, schemaInfoErr := checker.Check(txn.StartTS())
 	if schemaInfoErr != nil {
 		return errors.Trace(schemaInfoErr)
 	}
@@ -73,9 +76,16 @@ func (e *DDLExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 	e.done = true
 
 	// For each DDL, we should commit the previous transaction and create a new transaction.
+	// An exception is create local temporary table.
+	if s, ok := e.stmt.(*ast.CreateTableStmt); ok {
+		if s.TemporaryKeyword == ast.TemporaryLocal {
+			return e.createSessionTemporaryTable(s)
+		}
+	}
 	if err = e.ctx.NewTxn(ctx); err != nil {
 		return err
 	}
+
 	defer func() { e.ctx.GetSessionVars().StmtCtx.IsDDLJobInQueue = false }()
 
 	switch x := e.stmt.(type) {
@@ -121,7 +131,8 @@ func (e *DDLExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 		err = e.executeCreateSequence(x)
 	case *ast.DropSequenceStmt:
 		err = e.executeDropSequence(x)
-
+	case *ast.AlterSequenceStmt:
+		err = e.executeAlterSequence(x)
 	}
 	if err != nil {
 		// If the owner return ErrTableNotExists error when running this DDL, it may be caused by schema changed,
@@ -139,9 +150,8 @@ func (e *DDLExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 	is := dom.InfoSchema()
 	txnCtx := e.ctx.GetSessionVars().TxnCtx
 	txnCtx.InfoSchema = is
-	txnCtx.SchemaVersion = is.SchemaMetaVersion()
 	// DDL will force commit old transaction, after DDL, in transaction status should be false.
-	e.ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusInTrans, false)
+	e.ctx.GetSessionVars().SetInTxn(false)
 	return nil
 }
 
@@ -152,14 +162,23 @@ func (e *DDLExec) executeTruncateTable(s *ast.TruncateTableStmt) error {
 }
 
 func (e *DDLExec) executeRenameTable(s *ast.RenameTableStmt) error {
-	if len(s.TableToTables) != 1 {
-		// Now we only allow one schema changing at the same time.
-		return errors.Errorf("can't run multi schema change")
-	}
-	oldIdent := ast.Ident{Schema: s.OldTable.Schema, Name: s.OldTable.Name}
-	newIdent := ast.Ident{Schema: s.NewTable.Schema, Name: s.NewTable.Name}
 	isAlterTable := false
-	err := domain.GetDomain(e.ctx).DDL().RenameTable(e.ctx, oldIdent, newIdent, isAlterTable)
+	var err error
+	if len(s.TableToTables) == 1 {
+		oldIdent := ast.Ident{Schema: s.TableToTables[0].OldTable.Schema, Name: s.TableToTables[0].OldTable.Name}
+		newIdent := ast.Ident{Schema: s.TableToTables[0].NewTable.Schema, Name: s.TableToTables[0].NewTable.Name}
+		err = domain.GetDomain(e.ctx).DDL().RenameTable(e.ctx, oldIdent, newIdent, isAlterTable)
+	} else {
+		oldIdents := make([]ast.Ident, 0, len(s.TableToTables))
+		newIdents := make([]ast.Ident, 0, len(s.TableToTables))
+		for _, tables := range s.TableToTables {
+			oldIdent := ast.Ident{Schema: tables.OldTable.Schema, Name: tables.OldTable.Name}
+			newIdent := ast.Ident{Schema: tables.NewTable.Schema, Name: tables.NewTable.Name}
+			oldIdents = append(oldIdents, oldIdent)
+			newIdents = append(newIdents, newIdent)
+		}
+		err = domain.GetDomain(e.ctx).DDL().RenameTables(e.ctx, oldIdents, newIdents, isAlterTable)
+	}
 	return err
 }
 
@@ -195,6 +214,58 @@ func (e *DDLExec) executeCreateTable(s *ast.CreateTableStmt) error {
 	return err
 }
 
+func (e *DDLExec) createSessionTemporaryTable(s *ast.CreateTableStmt) error {
+	is := e.ctx.GetInfoSchema().(infoschema.InfoSchema)
+	dbInfo, ok := is.SchemaByName(s.Table.Schema)
+	if !ok {
+		return infoschema.ErrDatabaseNotExists.GenWithStackByArgs(s.Table.Schema.O)
+	}
+	tbInfo, err := ddl.BuildTableInfoWithCheck(e.ctx, s, dbInfo.Charset, dbInfo.Collate)
+	if err != nil {
+		return err
+	}
+
+	dom := domain.GetDomain(e.ctx)
+	// Local temporary table uses a real table ID.
+	// We could mock a table ID, but the mocked ID might be identical to an existing
+	// real table, and then we'll get into trouble.
+	err = kv.RunInNewTxn(context.Background(), dom.Store(), true, func(ctx context.Context, txn kv.Transaction) error {
+		m := meta.NewMeta(txn)
+		tblID, err := m.GenGlobalID()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		tbInfo.ID = tblID
+		tbInfo.State = model.StatePublic
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// AutoID is allocated in mocked..
+	alloc := autoid.NewAllocatorFromTempTblInfo(tbInfo)
+	tbl, err := tables.TableFromMeta([]autoid.Allocator{alloc}, tbInfo)
+	if err != nil {
+		return err
+	}
+
+	// Store this temporary table to the session.
+	sessVars := e.ctx.GetSessionVars()
+	if sessVars.LocalTemporaryTables == nil {
+		sessVars.LocalTemporaryTables = infoschema.NewLocalTemporaryTables()
+	}
+	localTempTables := sessVars.LocalTemporaryTables.(*infoschema.LocalTemporaryTables)
+	err = localTempTables.AddTable(dbInfo, tbl)
+
+	if err != nil && s.IfNotExists && infoschema.ErrTableExists.Equal(err) {
+		e.ctx.GetSessionVars().StmtCtx.AppendNote(err)
+		return nil
+	}
+
+	return err
+}
+
 func (e *DDLExec) executeCreateView(s *ast.CreateViewStmt) error {
 	err := domain.GetDomain(e.ctx).DDL().CreateView(e.ctx, s)
 	return err
@@ -227,11 +298,11 @@ func (e *DDLExec) executeDropDatabase(s *ast.DropDatabaseStmt) error {
 	sessionVars := e.ctx.GetSessionVars()
 	if err == nil && strings.ToLower(sessionVars.CurrentDB) == dbName.L {
 		sessionVars.CurrentDB = ""
-		err = variable.SetSessionSystemVar(sessionVars, variable.CharsetDatabase, types.NewStringDatum("utf8"))
+		err = variable.SetSessionSystemVar(sessionVars, variable.CharsetDatabase, mysql.DefaultCharset)
 		if err != nil {
 			return err
 		}
-		err = variable.SetSessionSystemVar(sessionVars, variable.CollationDatabase, types.NewStringDatum("utf8_unicode_ci"))
+		err = variable.SetSessionSystemVar(sessionVars, variable.CollationDatabase, mysql.DefaultCollationName)
 		if err != nil {
 			return err
 		}
@@ -302,14 +373,22 @@ func (e *DDLExec) dropTableObject(objects []*ast.TableName, obt objectType, ifEx
 		if isSystemTable(tn.Schema.L, tn.Name.L) {
 			return errors.Errorf("Drop tidb system table '%s.%s' is forbidden", tn.Schema.L, tn.Name.L)
 		}
-
-		if obt == tableObject && config.CheckTableBeforeDrop {
+		tableInfo, err := e.is.TableByName(tn.Schema, tn.Name)
+		if err != nil {
+			return err
+		}
+		tempTableType := tableInfo.Meta().TempTableType
+		if obt == tableObject && config.CheckTableBeforeDrop && tempTableType == model.TempTableNone {
 			logutil.BgLogger().Warn("admin check table before drop",
 				zap.String("database", fullti.Schema.O),
 				zap.String("table", fullti.Name.O),
 			)
-			sql := fmt.Sprintf("admin check table `%s`.`%s`", fullti.Schema.O, fullti.Name.O)
-			_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(sql)
+			exec := e.ctx.(sqlexec.RestrictedSQLExecutor)
+			stmt, err := exec.ParseWithParams(context.TODO(), "admin check table %n.%n", fullti.Schema.O, fullti.Name.O)
+			if err != nil {
+				return err
+			}
+			_, _, err = exec.ExecRestrictedStmt(context.TODO(), stmt)
 			if err != nil {
 				return err
 			}
@@ -382,6 +461,12 @@ func (e *DDLExec) executeRecoverTable(s *ast.RecoverTableStmt) error {
 	if err != nil {
 		return err
 	}
+	// Check the table ID was not exists.
+	tbl, ok := dom.InfoSchema().TableByID(tblInfo.ID)
+	if ok {
+		return infoschema.ErrTableExists.GenWithStack("Table '%-.192s' already been recover to '%-.192s', can't be recover repeatedly", s.Table.Name.O, tbl.Meta().Name.O)
+	}
+
 	autoIncID, autoRandID, err := e.getTableAutoIDsFromSnapshot(job)
 	if err != nil {
 		return err
@@ -452,71 +537,99 @@ func (e *DDLExec) getRecoverTableByJobID(s *ast.RecoverTableStmt, t *meta.Meta, 
 	return job, table.Meta(), nil
 }
 
+// GetDropOrTruncateTableInfoFromJobs gets the dropped/truncated table information from DDL jobs,
+// it will use the `start_ts` of DDL job as snapshot to get the dropped/truncated table information.
+func GetDropOrTruncateTableInfoFromJobs(jobs []*model.Job, gcSafePoint uint64, dom *domain.Domain, fn func(*model.Job, *model.TableInfo) (bool, error)) (bool, error) {
+	for _, job := range jobs {
+		// Check GC safe point for getting snapshot infoSchema.
+		err := gcutil.ValidateSnapshotWithGCSafePoint(job.StartTS, gcSafePoint)
+		if err != nil {
+			return false, err
+		}
+		if job.Type != model.ActionDropTable && job.Type != model.ActionTruncateTable {
+			continue
+		}
+
+		snapMeta, err := dom.GetSnapshotMeta(job.StartTS)
+		if err != nil {
+			return false, err
+		}
+		tbl, err := snapMeta.GetTable(job.SchemaID, job.TableID)
+		if err != nil {
+			if meta.ErrDBNotExists.Equal(err) {
+				// The dropped/truncated DDL maybe execute failed that caused by the parallel DDL execution,
+				// then can't find the table from the snapshot info-schema. Should just ignore error here,
+				// see more in TestParallelDropSchemaAndDropTable.
+				continue
+			}
+			return false, err
+		}
+		if tbl == nil {
+			// The dropped/truncated DDL maybe execute failed that caused by the parallel DDL execution,
+			// then can't find the table from the snapshot info-schema. Should just ignore error here,
+			// see more in TestParallelDropSchemaAndDropTable.
+			continue
+		}
+		finish, err := fn(job, tbl)
+		if err != nil || finish {
+			return finish, err
+		}
+	}
+	return false, nil
+}
+
 func (e *DDLExec) getRecoverTableByTableName(tableName *ast.TableName) (*model.Job, *model.TableInfo, error) {
 	txn, err := e.ctx.Txn(true)
 	if err != nil {
 		return nil, nil, err
 	}
-	t := meta.NewMeta(txn)
-	jobs, err := t.GetAllHistoryDDLJobs()
-	if err != nil {
-		return nil, nil, err
-	}
-	var job *model.Job
-	var tblInfo *model.TableInfo
-	gcSafePoint, err := gcutil.GetGCSafePoint(e.ctx)
-	if err != nil {
-		return nil, nil, err
-	}
 	schemaName := tableName.Schema.L
 	if schemaName == "" {
-		schemaName = e.ctx.GetSessionVars().CurrentDB
+		schemaName = strings.ToLower(e.ctx.GetSessionVars().CurrentDB)
 	}
 	if schemaName == "" {
 		return nil, nil, errors.Trace(core.ErrNoDB)
 	}
+	gcSafePoint, err := gcutil.GetGCSafePoint(e.ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var jobInfo *model.Job
+	var tableInfo *model.TableInfo
 	dom := domain.GetDomain(e.ctx)
-	// TODO: only search recent `e.JobNum` DDL jobs.
-	for i := len(jobs) - 1; i > 0; i-- {
-		job = jobs[i]
-		if job.Type != model.ActionDropTable && job.Type != model.ActionTruncateTable {
-			continue
+	handleJobAndTableInfo := func(job *model.Job, tblInfo *model.TableInfo) (bool, error) {
+		if tblInfo.Name.L != tableName.Name.L {
+			return false, nil
 		}
-		// Check GC safe point for getting snapshot infoSchema.
-		err = gcutil.ValidateSnapshotWithGCSafePoint(job.StartTS, gcSafePoint)
-		if err != nil {
+		schema, ok := dom.InfoSchema().SchemaByID(job.SchemaID)
+		if !ok {
+			return false, nil
+		}
+		if schema.Name.L == schemaName {
+			tableInfo = tblInfo
+			jobInfo = job
+			return true, nil
+		}
+		return false, nil
+	}
+	fn := func(jobs []*model.Job) (bool, error) {
+		return GetDropOrTruncateTableInfoFromJobs(jobs, gcSafePoint, dom, handleJobAndTableInfo)
+	}
+	err = admin.IterHistoryDDLJobs(txn, fn)
+	if err != nil {
+		if terror.ErrorEqual(variable.ErrSnapshotTooOld, err) {
 			return nil, nil, errors.Errorf("Can't find dropped/truncated table '%s' in GC safe point %s", tableName.Name.O, model.TSConvert2Time(gcSafePoint).String())
 		}
-		// Get the snapshot infoSchema before drop table.
-		snapInfo, err := dom.GetSnapshotInfoSchema(job.StartTS)
-		if err != nil {
-			return nil, nil, err
-		}
-		// Get table meta from snapshot infoSchema.
-		table, ok := snapInfo.TableByID(job.TableID)
-		if !ok {
-			return nil, nil, infoschema.ErrTableNotExists.GenWithStackByArgs(
-				fmt.Sprintf("(Schema ID %d)", job.SchemaID),
-				fmt.Sprintf("(Table ID %d)", job.TableID),
-			)
-		}
-		if table.Meta().Name.L == tableName.Name.L {
-			schema, ok := dom.InfoSchema().SchemaByID(job.SchemaID)
-			if !ok {
-				return nil, nil, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(
-					fmt.Sprintf("(Schema ID %d)", job.SchemaID),
-				)
-			}
-			if schema.Name.L == schemaName {
-				tblInfo = table.Meta()
-				break
-			}
-		}
+		return nil, nil, err
 	}
-	if tblInfo == nil {
+	if tableInfo == nil || jobInfo == nil {
 		return nil, nil, errors.Errorf("Can't find dropped/truncated table: %v in DDL history jobs", tableName.Name)
 	}
-	return job, tblInfo, nil
+	// Dropping local temporary tables won't appear in DDL jobs.
+	if tableInfo.TempTableType == model.TempTableGlobal {
+		return nil, nil, errUnsupportedFlashbackTmpTable
+	}
+	return jobInfo, tableInfo, nil
 }
 
 func (e *DDLExec) executeFlashbackTable(s *ast.FlashBackTableStmt) error {
@@ -558,7 +671,7 @@ func (e *DDLExec) executeLockTables(s *ast.LockTablesStmt) error {
 	return domain.GetDomain(e.ctx).DDL().LockTables(e.ctx, s)
 }
 
-func (e *DDLExec) executeUnlockTables(s *ast.UnlockTablesStmt) error {
+func (e *DDLExec) executeUnlockTables(_ *ast.UnlockTablesStmt) error {
 	if !config.TableLockEnabled() {
 		return nil
 	}
@@ -576,4 +689,8 @@ func (e *DDLExec) executeRepairTable(s *ast.RepairTableStmt) error {
 
 func (e *DDLExec) executeCreateSequence(s *ast.CreateSequenceStmt) error {
 	return domain.GetDomain(e.ctx).DDL().CreateSequence(e.ctx, s)
+}
+
+func (e *DDLExec) executeAlterSequence(s *ast.AlterSequenceStmt) error {
+	return domain.GetDomain(e.ctx).DDL().AlterSequence(e.ctx, s)
 }

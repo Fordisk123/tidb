@@ -28,7 +28,6 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/fastrand"
 	"github.com/pingcap/tidb/util/memory"
-	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tidb/util/testleak"
 )
 
@@ -82,49 +81,6 @@ func (s *testMiscSuite) TestRunWithRetry(c *C) {
 	c.Assert(cnt, Equals, 1)
 }
 
-func (s *testMiscSuite) TestCompatibleParseGCTime(c *C) {
-	values := []string{
-		"20181218-19:53:37 +0800 CST",
-		"20181218-19:53:37 +0800 MST",
-		"20181218-19:53:37 +0800 FOO",
-		"20181218-19:53:37 +0800 +08",
-		"20181218-19:53:37 +0800",
-		"20181218-19:53:37 +0800 ",
-		"20181218-11:53:37 +0000",
-	}
-
-	invalidValues := []string{
-		"",
-		" ",
-		"foo",
-		"20181218-11:53:37",
-		"20181218-19:53:37 +0800CST",
-		"20181218-19:53:37 +0800 FOO BAR",
-		"20181218-19:53:37 +0800FOOOOOOO BAR",
-		"20181218-19:53:37 ",
-	}
-
-	expectedTime := time.Date(2018, 12, 18, 11, 53, 37, 0, time.UTC)
-	expectedTimeFormatted := "20181218-19:53:37 +0800"
-
-	beijing, err := time.LoadLocation("Asia/Shanghai")
-	c.Assert(err, IsNil)
-
-	for _, value := range values {
-		t, err := CompatibleParseGCTime(value)
-		c.Assert(err, IsNil)
-		c.Assert(t.Equal(expectedTime), Equals, true)
-
-		formatted := t.In(beijing).Format(GCTimeFormat)
-		c.Assert(formatted, Equals, expectedTimeFormatted)
-	}
-
-	for _, value := range invalidValues {
-		_, err := CompatibleParseGCTime(value)
-		c.Assert(err, NotNil)
-	}
-}
-
 func (s *testMiscSuite) TestX509NameParseMatch(c *C) {
 	check := pkix.Name{
 		Names: []pkix.AttributeTypeAndValue{
@@ -174,10 +130,10 @@ func (s *testMiscSuite) TestBasicFunc(c *C) {
 		Command: mysql.ComSleep,
 		Plan:    nil,
 		Time:    time.Now(),
-		State:   1,
+		State:   3,
 		Info:    "test",
 		StmtCtx: &stmtctx.StatementContext{
-			MemTracker: memory.NewTracker(stringutil.StringerStr(""), -1),
+			MemTracker: memory.NewTracker(-1, -1),
 		},
 	}
 	row := pi.ToRowForShow(false)
@@ -190,12 +146,12 @@ func (s *testMiscSuite) TestBasicFunc(c *C) {
 	c.Assert(row[3], Equals, pi.DB)
 	c.Assert(row[4], Equals, "Sleep")
 	c.Assert(row[5], Equals, uint64(0))
-	c.Assert(row[6], Equals, "1")
+	c.Assert(row[6], Equals, "in transaction; autocommit")
 	c.Assert(row[7], Equals, "test")
 
 	row3 := pi.ToRow(time.UTC)
 	c.Assert(row3[:8], DeepEquals, row)
-	c.Assert(row3[8], Equals, int64(0))
+	c.Assert(row3[9], Equals, int64(0))
 
 	// Test for RandomBuf.
 	buf := fastrand.Buf(5)

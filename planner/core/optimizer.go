@@ -20,14 +20,18 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/lock"
 	"github.com/pingcap/tidb/planner/property"
 	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
+	utilhint "github.com/pingcap/tidb/util/hint"
 	"github.com/pingcap/tidb/util/set"
 	"go.uber.org/atomic"
 )
@@ -38,9 +42,13 @@ var OptimizeAstNode func(ctx context.Context, sctx sessionctx.Context, node ast.
 // AllowCartesianProduct means whether tidb allows cartesian join without equal conditions.
 var AllowCartesianProduct = atomic.NewBool(true)
 
+// IsReadOnly check whether the ast.Node is a read only statement.
+var IsReadOnly func(node ast.Node, vars *variable.SessionVars) bool
+
 const (
 	flagGcSubstitute uint64 = 1 << iota
 	flagPrunColumns
+	flagStabilizeResults
 	flagBuildKeyInfo
 	flagDecorrelate
 	flagEliminateAgg
@@ -58,6 +66,7 @@ const (
 var optRuleList = []logicalOptRule{
 	&gcSubstituter{},
 	&columnPruner{},
+	&resultsStabilizer{},
 	&buildKeySolver{},
 	&decorrelateSolver{},
 	&aggregationEliminator{},
@@ -82,7 +91,7 @@ type logicalOptRule interface {
 func BuildLogicalPlan(ctx context.Context, sctx sessionctx.Context, node ast.Node, is infoschema.InfoSchema) (Plan, types.NameSlice, error) {
 	sctx.GetSessionVars().PlanID = 0
 	sctx.GetSessionVars().PlanColumnID = 0
-	builder := NewPlanBuilder(sctx, is, &BlockHintProcessor{})
+	builder, _ := NewPlanBuilder(sctx, is, &utilhint.BlockHintProcessor{})
 	p, err := builder.Build(ctx, node)
 	if err != nil {
 		return nil, nil, err
@@ -93,9 +102,16 @@ func BuildLogicalPlan(ctx context.Context, sctx sessionctx.Context, node ast.Nod
 // CheckPrivilege checks the privilege for a user.
 func CheckPrivilege(activeRoles []*auth.RoleIdentity, pm privilege.Manager, vs []visitInfo) error {
 	for _, v := range vs {
-		if !pm.RequestVerification(activeRoles, v.db, v.table, v.column, v.privilege) {
+		if v.privilege == mysql.ExtendedPriv {
+			if !pm.RequestDynamicVerification(activeRoles, v.dynamicPriv, v.dynamicWithGrant) {
+				if v.err == nil {
+					return ErrPrivilegeCheckFail.GenWithStackByArgs(v.dynamicPriv)
+				}
+				return v.err
+			}
+		} else if !pm.RequestVerification(activeRoles, v.db, v.table, v.column, v.privilege) {
 			if v.err == nil {
-				return ErrPrivilegeCheckFail
+				return ErrPrivilegeCheckFail.GenWithStackByArgs(v.privilege.String())
 			}
 			return v.err
 		}
@@ -110,7 +126,7 @@ func CheckTableLock(ctx sessionctx.Context, is infoschema.InfoSchema, vs []visit
 	}
 	checker := lock.NewChecker(ctx, is)
 	for i := range vs {
-		err := checker.CheckTableLock(vs[i].db, vs[i].table, vs[i].privilege)
+		err := checker.CheckTableLock(vs[i].db, vs[i].table, vs[i].privilege, vs[i].alterWritable)
 		if err != nil {
 			return err
 		}
@@ -118,8 +134,21 @@ func CheckTableLock(ctx sessionctx.Context, is infoschema.InfoSchema, vs []visit
 	return nil
 }
 
+func checkStableResultMode(sctx sessionctx.Context) bool {
+	s := sctx.GetSessionVars()
+	st := s.StmtCtx
+	return s.EnableStableResultMode && (!st.InInsertStmt && !st.InUpdateStmt && !st.InDeleteStmt && !st.InLoadDataStmt)
+}
+
 // DoOptimize optimizes a logical plan to a physical plan.
 func DoOptimize(ctx context.Context, sctx sessionctx.Context, flag uint64, logic LogicalPlan) (PhysicalPlan, float64, error) {
+	// if there is something after flagPrunColumns, do flagPrunColumnsAgain
+	if flag&flagPrunColumns > 0 && flag-flagPrunColumns > flagPrunColumns {
+		flag |= flagPrunColumnsAgain
+	}
+	if checkStableResultMode(sctx) {
+		flag |= flagStabilizeResults
+	}
 	logic, err := logicalOptimize(ctx, flag, logic)
 	if err != nil {
 		return nil, 0, err
@@ -127,7 +156,11 @@ func DoOptimize(ctx context.Context, sctx sessionctx.Context, flag uint64, logic
 	if !AllowCartesianProduct.Load() && existsCartesianProduct(logic) {
 		return nil, 0, errors.Trace(ErrCartesianProductUnsupported)
 	}
-	physical, cost, err := physicalOptimize(logic)
+	planCounter := PlanCounterTp(sctx.GetSessionVars().StmtCtx.StmtHints.ForceNthPlan)
+	if planCounter == 0 {
+		planCounter = -1
+	}
+	physical, cost, err := physicalOptimize(logic, &planCounter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -135,10 +168,66 @@ func DoOptimize(ctx context.Context, sctx sessionctx.Context, flag uint64, logic
 	return finalPlan, cost, nil
 }
 
+// mergeContinuousSelections merge continuous selections which may occur after changing plans.
+func mergeContinuousSelections(p PhysicalPlan) {
+	if sel, ok := p.(*PhysicalSelection); ok {
+		for {
+			childSel := sel.children[0]
+			if tmp, ok := childSel.(*PhysicalSelection); ok {
+				sel.Conditions = append(sel.Conditions, tmp.Conditions...)
+				sel.SetChild(0, tmp.children[0])
+			} else {
+				break
+			}
+		}
+	}
+	for _, child := range p.Children() {
+		mergeContinuousSelections(child)
+	}
+	// merge continuous selections in a coprocessor task of tiflash
+	tableReader, isTableReader := p.(*PhysicalTableReader)
+	if isTableReader && tableReader.StoreType == kv.TiFlash {
+		mergeContinuousSelections(tableReader.tablePlan)
+		tableReader.TablePlans = flattenPushDownPlan(tableReader.tablePlan)
+	}
+}
+
 func postOptimize(sctx sessionctx.Context, plan PhysicalPlan) PhysicalPlan {
 	plan = eliminatePhysicalProjection(plan)
-	plan = injectExtraProjection(plan)
+	plan = InjectExtraProjection(plan)
+	mergeContinuousSelections(plan)
 	plan = eliminateUnionScanAndLock(sctx, plan)
+	plan = enableParallelApply(sctx, plan)
+	return plan
+}
+
+func enableParallelApply(sctx sessionctx.Context, plan PhysicalPlan) PhysicalPlan {
+	if !sctx.GetSessionVars().EnableParallelApply {
+		return plan
+	}
+	// the parallel apply has three limitation:
+	// 1. the parallel implementation now cannot keep order;
+	// 2. the inner child has to support clone;
+	// 3. if one Apply is in the inner side of another Apply, it cannot be parallel, for example:
+	//		The topology of 3 Apply operators are A1(A2, A3), which means A2 is the outer child of A1
+	//		while A3 is the inner child. Then A1 and A2 can be parallel and A3 cannot.
+	if apply, ok := plan.(*PhysicalApply); ok {
+		outerIdx := 1 - apply.InnerChildIdx
+		noOrder := len(apply.GetChildReqProps(outerIdx).SortItems) == 0 // limitation 1
+		_, err := SafeClone(apply.Children()[apply.InnerChildIdx])
+		supportClone := err == nil // limitation 2
+		if noOrder && supportClone {
+			apply.Concurrency = sctx.GetSessionVars().ExecutorConcurrency
+		}
+
+		// because of the limitation 3, we cannot parallelize Apply operators in this Apply's inner size,
+		// so we only invoke recursively for its outer child.
+		apply.SetChild(outerIdx, enableParallelApply(sctx, apply.Children()[outerIdx]))
+		return apply
+	}
+	for i, child := range plan.Children() {
+		plan.SetChild(i, enableParallelApply(sctx, child))
+	}
 	return plan
 }
 
@@ -164,8 +253,8 @@ func isLogicalRuleDisabled(r logicalOptRule) bool {
 	return disabled
 }
 
-func physicalOptimize(logic LogicalPlan) (PhysicalPlan, float64, error) {
-	if _, err := logic.recursiveDeriveStats(); err != nil {
+func physicalOptimize(logic LogicalPlan, planCounter *PlanCounterTp) (PhysicalPlan, float64, error) {
+	if _, err := logic.recursiveDeriveStats(nil); err != nil {
 		return nil, 0, err
 	}
 
@@ -176,9 +265,13 @@ func physicalOptimize(logic LogicalPlan) (PhysicalPlan, float64, error) {
 		ExpectedCnt: math.MaxFloat64,
 	}
 
-	t, err := logic.findBestTask(prop)
+	logic.SCtx().GetSessionVars().StmtCtx.TaskMapBakTS = 0
+	t, _, err := logic.findBestTask(prop, planCounter)
 	if err != nil {
 		return nil, 0, err
+	}
+	if *planCounter > 0 {
+		logic.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.Errorf("The parameter of nth_plan() is out of range."))
 	}
 	if t.invalid() {
 		return nil, 0, ErrInternal.GenWithStackByArgs("Can't find a proper physical plan for this query")
@@ -273,6 +366,7 @@ var DefaultDisabledLogicalRulesList *atomic.Value
 
 func init() {
 	expression.EvalAstExpr = evalAstExpr
+	expression.RewriteAstExpr = rewriteAstExpr
 	DefaultDisabledLogicalRulesList = new(atomic.Value)
 	DefaultDisabledLogicalRulesList.Store(set.NewStringSet())
 }

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/cznic/mathutil"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
@@ -25,6 +26,8 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 // Build is used to build a specific AggFunc implementation according to the
@@ -34,9 +37,9 @@ func Build(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal
 	case ast.AggFuncCount:
 		return buildCount(aggFuncDesc, ordinal)
 	case ast.AggFuncSum:
-		return buildSum(aggFuncDesc, ordinal)
+		return buildSum(ctx, aggFuncDesc, ordinal)
 	case ast.AggFuncAvg:
-		return buildAvg(aggFuncDesc, ordinal)
+		return buildAvg(ctx, aggFuncDesc, ordinal)
 	case ast.AggFuncFirstRow:
 		return buildFirstRow(aggFuncDesc, ordinal)
 	case ast.AggFuncMax:
@@ -53,8 +56,18 @@ func Build(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal
 		return buildBitAnd(aggFuncDesc, ordinal)
 	case ast.AggFuncVarPop:
 		return buildVarPop(aggFuncDesc, ordinal)
+	case ast.AggFuncStddevPop:
+		return buildStdDevPop(aggFuncDesc, ordinal)
 	case ast.AggFuncJsonObjectAgg:
 		return buildJSONObjectAgg(aggFuncDesc, ordinal)
+	case ast.AggFuncApproxCountDistinct:
+		return buildApproxCountDistinct(aggFuncDesc, ordinal)
+	case ast.AggFuncApproxPercentile:
+		return buildApproxPercentile(ctx, aggFuncDesc, ordinal)
+	case ast.AggFuncVarSamp:
+		return buildVarSamp(aggFuncDesc, ordinal)
+	case ast.AggFuncStddevSamp:
+		return buildStddevSamp(aggFuncDesc, ordinal)
 	}
 	return nil
 }
@@ -79,14 +92,93 @@ func BuildWindowFunctions(ctx sessionctx.Context, windowFuncDesc *aggregation.Ag
 	case ast.WindowFuncNtile:
 		return buildNtile(windowFuncDesc, ordinal)
 	case ast.WindowFuncPercentRank:
-		return buildPercenRank(ordinal, orderByCols)
+		return buildPercentRank(ordinal, orderByCols)
 	case ast.WindowFuncLead:
-		return buildLead(windowFuncDesc, ordinal)
+		return buildLead(ctx, windowFuncDesc, ordinal)
 	case ast.WindowFuncLag:
-		return buildLag(windowFuncDesc, ordinal)
+		return buildLag(ctx, windowFuncDesc, ordinal)
+	case ast.AggFuncMax:
+		// The max/min aggFunc using in the window function will using the sliding window algo.
+		return buildMaxMinInWindowFunction(windowFuncDesc, ordinal, true)
+	case ast.AggFuncMin:
+		return buildMaxMinInWindowFunction(windowFuncDesc, ordinal, false)
 	default:
 		return Build(ctx, windowFuncDesc, ordinal)
 	}
+}
+
+func buildApproxCountDistinct(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+	base := baseApproxCountDistinct{baseAggFunc{
+		args:    aggFuncDesc.Args,
+		ordinal: ordinal,
+	}}
+
+	// In partition table, union need to compute partial result into partial result.
+	// We can detect and handle this case by checking whether return type is string.
+
+	switch aggFuncDesc.RetTp.Tp {
+	case mysql.TypeLonglong:
+		switch aggFuncDesc.Mode {
+		case aggregation.CompleteMode:
+			return &approxCountDistinctOriginal{base}
+		case aggregation.Partial1Mode:
+			return &approxCountDistinctPartial1{approxCountDistinctOriginal{base}}
+		case aggregation.Partial2Mode:
+			return &approxCountDistinctPartial2{approxCountDistinctPartial1{approxCountDistinctOriginal{base}}}
+		case aggregation.FinalMode:
+			return &approxCountDistinctFinal{approxCountDistinctPartial2{approxCountDistinctPartial1{approxCountDistinctOriginal{base}}}}
+		}
+	case mysql.TypeString:
+		switch aggFuncDesc.Mode {
+		case aggregation.CompleteMode, aggregation.Partial1Mode:
+			return &approxCountDistinctPartial1{approxCountDistinctOriginal{base}}
+		case aggregation.Partial2Mode, aggregation.FinalMode:
+			return &approxCountDistinctPartial2{approxCountDistinctPartial1{approxCountDistinctOriginal{base}}}
+		}
+	}
+
+	return nil
+}
+
+func buildApproxPercentile(sctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+	if aggFuncDesc.Mode == aggregation.DedupMode {
+		return nil
+	}
+
+	// Checked while building descriptor
+	percent, _, err := aggFuncDesc.Args[1].EvalInt(sctx, chunk.Row{})
+	if err != nil {
+		// Should not reach here
+		logutil.BgLogger().Error("Error happened when buildApproxPercentile", zap.Error(err))
+		return nil
+	}
+
+	base := basePercentile{percent: int(percent), baseAggFunc: baseAggFunc{args: aggFuncDesc.Args, ordinal: ordinal}}
+
+	evalType := aggFuncDesc.Args[0].GetType().EvalType()
+	if aggFuncDesc.Args[0].GetType().Tp == mysql.TypeBit {
+		evalType = types.ETString // same as other aggregate function
+	}
+	switch aggFuncDesc.Mode {
+	case aggregation.CompleteMode, aggregation.Partial1Mode, aggregation.FinalMode:
+		switch evalType {
+		case types.ETInt:
+			return &percentileOriginal4Int{base}
+		case types.ETReal:
+			return &percentileOriginal4Real{base}
+		case types.ETDecimal:
+			return &percentileOriginal4Decimal{base}
+		case types.ETDatetime, types.ETTimestamp:
+			return &percentileOriginal4Time{base}
+		case types.ETDuration:
+			return &percentileOriginal4Duration{base}
+		default:
+			// Return NULL in any case
+			return &base
+		}
+	}
+
+	return nil
 }
 
 // buildCount builds the AggFunc implementation for function "COUNT".
@@ -105,6 +197,25 @@ func buildCount(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 	// use countOriginalWithDistinct.
 	if aggFuncDesc.HasDistinct &&
 		(aggFuncDesc.Mode == aggregation.CompleteMode || aggFuncDesc.Mode == aggregation.Partial1Mode) {
+		if len(base.args) == 1 {
+			// optimize with single column
+			// TODO: because Time and JSON does not have `hashcode()` or similar method
+			// so they're in exception for now.
+			// TODO: add hashCode method for all evaluate types (Decimal, Time, Duration, JSON).
+			// https://github.com/pingcap/tidb/issues/15857
+			switch aggFuncDesc.Args[0].GetType().EvalType() {
+			case types.ETInt:
+				return &countOriginalWithDistinct4Int{baseCount{base}}
+			case types.ETReal:
+				return &countOriginalWithDistinct4Real{baseCount{base}}
+			case types.ETDecimal:
+				return &countOriginalWithDistinct4Decimal{baseCount{base}}
+			case types.ETDuration:
+				return &countOriginalWithDistinct4Duration{baseCount{base}}
+			case types.ETString:
+				return &countOriginalWithDistinct4String{baseCount{base}}
+			}
+		}
 		return &countOriginalWithDistinct{baseCount{base}}
 	}
 
@@ -134,13 +245,18 @@ func buildCount(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 }
 
 // buildSum builds the AggFunc implementation for function "SUM".
-func buildSum(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+func buildSum(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 	base := baseSumAggFunc{
 		baseAggFunc: baseAggFunc{
 			args:    aggFuncDesc.Args,
 			ordinal: ordinal,
 		},
 	}
+	frac := base.args[0].GetType().Decimal
+	if frac == -1 {
+		frac = mysql.MaxDecimalScale
+	}
+	base.frac = mathutil.Min(frac, mysql.MaxDecimalScale)
 	switch aggFuncDesc.Mode {
 	case aggregation.DedupMode:
 		return nil
@@ -155,17 +271,29 @@ func buildSum(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 			if aggFuncDesc.HasDistinct {
 				return &sum4DistinctFloat64{base}
 			}
-			return &sum4Float64{base}
+			if ctx.GetSessionVars().WindowingUseHighPrecision {
+				return &sum4Float64HighPrecision{baseSum4Float64{base}}
+			}
+			return &sum4Float64{baseSum4Float64{base}}
 		}
 	}
 }
 
 // buildAvg builds the AggFunc implementation for function "AVG".
-func buildAvg(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+func buildAvg(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 	base := baseAggFunc{
 		args:    aggFuncDesc.Args,
 		ordinal: ordinal,
 	}
+	frac := base.args[0].GetType().Decimal
+	if len(base.args) == 2 {
+		frac = base.args[1].GetType().Decimal
+	}
+	if frac == -1 {
+		frac = mysql.MaxDecimalScale
+	}
+	base.frac = mathutil.Min(frac, mysql.MaxDecimalScale)
+
 	switch aggFuncDesc.Mode {
 	// Build avg functions which consume the original data and remove the
 	// duplicated input of the same group.
@@ -185,7 +313,10 @@ func buildAvg(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 			if aggFuncDesc.HasDistinct {
 				return &avgOriginal4DistinctFloat64{base}
 			}
-			return &avgOriginal4Float64{baseAvgFloat64{base}}
+			if ctx.GetSessionVars().WindowingUseHighPrecision {
+				return &avgOriginal4Float64HighPrecision{baseAvgFloat64{base}}
+			}
+			return &avgOriginal4Float64{avgOriginal4Float64HighPrecision{baseAvgFloat64{base}}}
 		}
 
 	// Build avg functions which consume the partial result of other avg
@@ -207,6 +338,11 @@ func buildFirstRow(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 		args:    aggFuncDesc.Args,
 		ordinal: ordinal,
 	}
+	frac := base.args[0].GetType().Decimal
+	if frac == -1 {
+		frac = mysql.MaxDecimalScale
+	}
+	base.frac = mathutil.Min(frac, mysql.MaxDecimalScale)
 
 	evalType, fieldType := aggFuncDesc.RetTp.EvalType(), aggFuncDesc.RetTp
 	if fieldType.Tp == mysql.TypeBit {
@@ -256,6 +392,11 @@ func buildMaxMin(aggFuncDesc *aggregation.AggFuncDesc, ordinal int, isMax bool) 
 		},
 		isMax: isMax,
 	}
+	frac := base.args[0].GetType().Decimal
+	if frac == -1 {
+		frac = mysql.MaxDecimalScale
+	}
+	base.frac = mathutil.Min(frac, mysql.MaxDecimalScale)
 
 	evalType, fieldType := aggFuncDesc.RetTp.EvalType(), aggFuncDesc.RetTp
 	if fieldType.Tp == mysql.TypeBit {
@@ -264,6 +405,13 @@ func buildMaxMin(aggFuncDesc *aggregation.AggFuncDesc, ordinal int, isMax bool) 
 	switch aggFuncDesc.Mode {
 	case aggregation.DedupMode:
 	default:
+		switch fieldType.Tp {
+		case mysql.TypeEnum:
+			return &maxMin4Enum{base}
+		case mysql.TypeSet:
+			return &maxMin4Set{base}
+		}
+
 		switch evalType {
 		case types.ETInt:
 			if mysql.HasUnsignedFlag(fieldType.Flag) {
@@ -292,16 +440,37 @@ func buildMaxMin(aggFuncDesc *aggregation.AggFuncDesc, ordinal int, isMax bool) 
 	return nil
 }
 
+// buildMaxMin builds the AggFunc implementation for function "MAX" and "MIN" using by window function.
+func buildMaxMinInWindowFunction(aggFuncDesc *aggregation.AggFuncDesc, ordinal int, isMax bool) AggFunc {
+	base := buildMaxMin(aggFuncDesc, ordinal, isMax)
+	// build max/min aggFunc for window function using sliding window
+	switch baseAggFunc := base.(type) {
+	case *maxMin4Int:
+		return &maxMin4IntSliding{*baseAggFunc, windowInfo{}}
+	case *maxMin4Uint:
+		return &maxMin4UintSliding{*baseAggFunc, windowInfo{}}
+	case *maxMin4Float32:
+		return &maxMin4Float32Sliding{*baseAggFunc, windowInfo{}}
+	case *maxMin4Float64:
+		return &maxMin4Float64Sliding{*baseAggFunc, windowInfo{}}
+	case *maxMin4Decimal:
+		return &maxMin4DecimalSliding{*baseAggFunc, windowInfo{}}
+	case *maxMin4String:
+		return &maxMin4StringSliding{*baseAggFunc, windowInfo{}}
+	case *maxMin4Time:
+		return &maxMin4TimeSliding{*baseAggFunc, windowInfo{}}
+	case *maxMin4Duration:
+		return &maxMin4DurationSliding{*baseAggFunc, windowInfo{}}
+	}
+	return base
+}
+
 // buildGroupConcat builds the AggFunc implementation for function "GROUP_CONCAT".
 func buildGroupConcat(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 	switch aggFuncDesc.Mode {
 	case aggregation.DedupMode:
 		return nil
 	default:
-		base := baseAggFunc{
-			args:    aggFuncDesc.Args[:len(aggFuncDesc.Args)-1],
-			ordinal: ordinal,
-		}
 		// The last arg is promised to be a not-null string constant, so the error can be ignored.
 		c, _ := aggFuncDesc.Args[len(aggFuncDesc.Args)-1].(*expression.Constant)
 		sep, _, err := c.EvalString(nil, chunk.Row{})
@@ -310,7 +479,7 @@ func buildGroupConcat(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDe
 			panic(fmt.Sprintf("Error happened when buildGroupConcat: %s", err.Error()))
 		}
 		var s string
-		s, err = variable.GetSessionSystemVar(ctx.GetSessionVars(), variable.GroupConcatMaxLen)
+		s, err = variable.GetSessionOrGlobalSystemVar(ctx.GetSessionVars(), variable.GroupConcatMaxLen)
 		if err != nil {
 			panic(fmt.Sprintf("Error happened when buildGroupConcat: no system variable named '%s'", variable.GroupConcatMaxLen))
 		}
@@ -320,10 +489,26 @@ func buildGroupConcat(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDe
 			panic(fmt.Sprintf("Error happened when buildGroupConcat: %s", err.Error()))
 		}
 		var truncated int32
-		if aggFuncDesc.HasDistinct {
-			return &groupConcatDistinct{baseGroupConcat4String{baseAggFunc: base, sep: sep, maxLen: maxLen, truncated: &truncated}}
+		base := baseGroupConcat4String{
+			baseAggFunc: baseAggFunc{
+				args:    aggFuncDesc.Args[:len(aggFuncDesc.Args)-1],
+				ordinal: ordinal,
+			},
+			byItems:   aggFuncDesc.OrderByItems,
+			sep:       sep,
+			maxLen:    maxLen,
+			truncated: &truncated,
 		}
-		return &groupConcat{baseGroupConcat4String{baseAggFunc: base, sep: sep, maxLen: maxLen, truncated: &truncated}}
+		if aggFuncDesc.HasDistinct {
+			if len(aggFuncDesc.OrderByItems) > 0 {
+				return &groupConcatDistinctOrder{base}
+			}
+			return &groupConcatDistinct{base}
+		}
+		if len(aggFuncDesc.OrderByItems) > 0 {
+			return &groupConcatOrder{base}
+		}
+		return &groupConcat{base}
 	}
 }
 
@@ -370,6 +555,63 @@ func buildVarPop(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
 			return &varPop4DistinctFloat64{base}
 		}
 		return &varPop4Float64{base}
+	}
+}
+
+// buildStdDevPop builds the AggFunc implementation for function "STD()/STDDEV()/STDDEV_POP()"
+func buildStdDevPop(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+	base := baseVarPopAggFunc{
+		baseAggFunc{
+			args:    aggFuncDesc.Args,
+			ordinal: ordinal,
+		},
+	}
+	switch aggFuncDesc.Mode {
+	case aggregation.DedupMode:
+		return nil
+	default:
+		if aggFuncDesc.HasDistinct {
+			return &stdDevPop4DistinctFloat64{varPop4DistinctFloat64{base}}
+		}
+		return &stdDevPop4Float64{varPop4Float64{base}}
+	}
+}
+
+// buildVarSamp builds the AggFunc implementation for function "VAR_SAMP()"
+func buildVarSamp(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+	base := baseVarPopAggFunc{
+		baseAggFunc{
+			args:    aggFuncDesc.Args,
+			ordinal: ordinal,
+		},
+	}
+	switch aggFuncDesc.Mode {
+	case aggregation.DedupMode:
+		return nil
+	default:
+		if aggFuncDesc.HasDistinct {
+			return &varSamp4DistinctFloat64{varPop4DistinctFloat64{base}}
+		}
+		return &varSamp4Float64{varPop4Float64{base}}
+	}
+}
+
+// buildStddevSamp builds the AggFunc implementation for function "STDDEV_SAMP()"
+func buildStddevSamp(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+	base := baseVarPopAggFunc{
+		baseAggFunc{
+			args:    aggFuncDesc.Args,
+			ordinal: ordinal,
+		},
+	}
+	switch aggFuncDesc.Mode {
+	case aggregation.DedupMode:
+		return nil
+	default:
+		if aggFuncDesc.HasDistinct {
+			return &stddevSamp4DistinctFloat64{varPop4DistinctFloat64{base}}
+		}
+		return &stddevSamp4Float64{varPop4Float64{base}}
 	}
 }
 
@@ -447,34 +689,42 @@ func buildNtile(aggFuncDes *aggregation.AggFuncDesc, ordinal int) AggFunc {
 	return &ntile{baseAggFunc: base, n: n}
 }
 
-func buildPercenRank(ordinal int, orderByCols []*expression.Column) AggFunc {
+func buildPercentRank(ordinal int, orderByCols []*expression.Column) AggFunc {
 	base := baseAggFunc{
 		ordinal: ordinal,
 	}
 	return &percentRank{baseAggFunc: base, rowComparer: buildRowComparer(orderByCols)}
 }
 
-func buildLeadLag(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) baseLeadLag {
+func buildLeadLag(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal int) baseLeadLag {
 	offset := uint64(1)
 	if len(aggFuncDesc.Args) >= 2 {
 		offset, _, _ = expression.GetUint64FromConstant(aggFuncDesc.Args[1])
 	}
 	var defaultExpr expression.Expression
-	defaultExpr = expression.Null
+	defaultExpr = expression.NewNull()
 	if len(aggFuncDesc.Args) == 3 {
 		defaultExpr = aggFuncDesc.Args[2]
+		switch et := defaultExpr.(type) {
+		case *expression.Constant:
+			res, err1 := et.Value.ConvertTo(ctx.GetSessionVars().StmtCtx, aggFuncDesc.RetTp)
+			if err1 == nil {
+				defaultExpr = &expression.Constant{Value: res, RetType: aggFuncDesc.RetTp}
+			}
+		}
 	}
 	base := baseAggFunc{
 		args:    aggFuncDesc.Args,
 		ordinal: ordinal,
 	}
-	return baseLeadLag{baseAggFunc: base, offset: offset, defaultExpr: defaultExpr, valueEvaluator: buildValueEvaluator(aggFuncDesc.RetTp)}
+	ve, _ := buildValueEvaluator(aggFuncDesc.RetTp)
+	return baseLeadLag{baseAggFunc: base, offset: offset, defaultExpr: defaultExpr, valueEvaluator: ve}
 }
 
-func buildLead(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
-	return &lead{buildLeadLag(aggFuncDesc, ordinal)}
+func buildLead(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+	return &lead{buildLeadLag(ctx, aggFuncDesc, ordinal)}
 }
 
-func buildLag(aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
-	return &lag{buildLeadLag(aggFuncDesc, ordinal)}
+func buildLag(ctx sessionctx.Context, aggFuncDesc *aggregation.AggFuncDesc, ordinal int) AggFunc {
+	return &lag{buildLeadLag(ctx, aggFuncDesc, ordinal)}
 }

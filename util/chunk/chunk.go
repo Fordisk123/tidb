@@ -26,7 +26,7 @@ import (
 var msgErrSelNotNil = "The selection vector of Chunk is not nil. Please file a bug to the TiDB Team"
 
 // Chunk stores multiple rows of data in Apache Arrow format.
-// See https://arrow.apache.org/docs/memory_layout.html
+// See https://arrow.apache.org/docs/format/Columnar.html#physical-memory-layout
 // Values are appended in compact format and can be directly accessed without decoding.
 // When the chunk is done processing, we can reuse the allocated memory by resetting it.
 type Chunk struct {
@@ -128,12 +128,12 @@ func renewEmpty(chk *Chunk) *Chunk {
 	return newChk
 }
 
-// MemoryUsage returns the total memory usage of a Chunk in B.
+// MemoryUsage returns the total memory usage of a Chunk in bytes.
 // We ignore the size of Column.length and Column.nullCount
 // since they have little effect of the total memory usage.
 func (c *Chunk) MemoryUsage() (sum int64) {
 	for _, col := range c.columns {
-		curColMemUsage := int64(unsafe.Sizeof(*col)) + int64(cap(col.nullBitmap)) + int64(cap(col.offsets)*4) + int64(cap(col.data)) + int64(cap(col.elemBuf))
+		curColMemUsage := int64(unsafe.Sizeof(*col)) + int64(cap(col.nullBitmap)) + int64(cap(col.offsets)*8) + int64(cap(col.data)) + int64(cap(col.elemBuf))
 		sum += curColMemUsage
 	}
 	return
@@ -291,6 +291,21 @@ func (c *Chunk) CopyConstruct() *Chunk {
 	return newChk
 }
 
+// CopyConstructSel is just like CopyConstruct,
+// but ignore the rows that was not selected.
+func (c *Chunk) CopyConstructSel() *Chunk {
+	if c.sel == nil {
+		return c.CopyConstruct()
+	}
+	newChk := renewWithCapacity(c, c.capacity, c.requiredRows)
+	for colIdx, dstCol := range newChk.columns {
+		for _, rowIdx := range c.sel {
+			appendCellByCell(dstCol, c.columns[colIdx], rowIdx)
+		}
+	}
+	return newChk
+}
+
 // GrowAndReset resets the Chunk and doubles the capacity of the Chunk.
 // The doubled capacity should not be larger than maxChunkSize.
 // TODO: this method will be used in following PR.
@@ -350,7 +365,7 @@ func (c *Chunk) GetRow(idx int) Row {
 		//	logical 2 -> physical 6.
 		// Then when we iterate this Chunk according to Row, only selected rows will be
 		// accessed while all filtered rows will be ignored.
-		return Row{c: c, idx: int(c.sel[idx])}
+		return Row{c: c, idx: c.sel[idx]}
 	}
 	return Row{c: c, idx: idx}
 }
@@ -505,8 +520,10 @@ func (c *Chunk) Append(other *Chunk, begin, end int) {
 		} else {
 			beginOffset, endOffset := src.offsets[begin], src.offsets[end]
 			dst.data = append(dst.data, src.data[beginOffset:endOffset]...)
+			lastOffset := dst.offsets[len(dst.offsets)-1]
 			for i := begin; i < end; i++ {
-				dst.offsets = append(dst.offsets, dst.offsets[len(dst.offsets)-1]+src.offsets[i+1]-src.offsets[i])
+				lastOffset += src.offsets[i+1] - src.offsets[i]
+				dst.offsets = append(dst.offsets, lastOffset)
 			}
 		}
 		for i := begin; i < end; i++ {
@@ -588,7 +605,6 @@ func (c *Chunk) AppendBytes(colIdx int, b []byte) {
 }
 
 // AppendTime appends a Time value to the chunk.
-// TODO: change the time structure so it can be directly written to memory.
 func (c *Chunk) AppendTime(colIdx int, t types.Time) {
 	c.appendSel(colIdx)
 	c.columns[colIdx].AppendTime(t)
@@ -695,4 +711,34 @@ func (c *Chunk) Reconstruct() {
 	}
 	c.numVirtualRows = len(c.sel)
 	c.sel = nil
+}
+
+// ToString returns all the values in a chunk.
+func (c *Chunk) ToString(ft []*types.FieldType) string {
+	var buf []byte
+	for rowIdx := 0; rowIdx < c.NumRows(); rowIdx++ {
+		row := c.GetRow(rowIdx)
+		buf = append(buf, row.ToString(ft)...)
+		buf = append(buf, '\n')
+	}
+	return string(buf)
+}
+
+// AppendRows appends multiple rows to the chunk.
+func (c *Chunk) AppendRows(rows []Row) {
+	c.AppendPartialRows(0, rows)
+	c.numVirtualRows += len(rows)
+}
+
+// AppendPartialRows appends multiple rows to the chunk.
+func (c *Chunk) AppendPartialRows(colOff int, rows []Row) {
+	columns := c.columns[colOff:]
+	for i, dstCol := range columns {
+		for _, srcRow := range rows {
+			if i == 0 {
+				c.appendSel(colOff)
+			}
+			appendCellByCell(dstCol, srcRow.c.columns[i], srcRow.idx)
+		}
+	}
 }

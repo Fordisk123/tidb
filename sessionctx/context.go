@@ -16,16 +16,28 @@ package sessionctx
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/kvcache"
-	"github.com/pingcap/tidb/util/memory"
+	"github.com/pingcap/tidb/util/sli"
 	"github.com/pingcap/tipb/go-binlog"
+	"github.com/tikv/client-go/v2/oracle"
 )
+
+// InfoschemaMetaVersion is a workaround. Due to circular dependency,
+// can not return the complete interface. But SchemaMetaVersion is widely used for logging.
+// So we give a convenience for that.
+// FIXME: remove this interface
+type InfoschemaMetaVersion interface {
+	SchemaMetaVersion() int64
+}
 
 // Context is an interface for transaction and executive args environment.
 type Context interface {
@@ -33,6 +45,8 @@ type Context interface {
 	// If old transaction is valid, it is committed first.
 	// It's used in BEGIN statement and DDL statements to commit old transaction.
 	NewTxn(context.Context) error
+	// NewStaleTxnWithStartTS initializes a staleness transaction with the given StartTS.
+	NewStaleTxnWithStartTS(ctx context.Context, startTS uint64) error
 
 	// Txn returns the current transaction which is created before executing a statement.
 	// The returned kv.Transaction is not nil, but it maybe pending or invalid.
@@ -43,6 +57,9 @@ type Context interface {
 	// GetClient gets a kv.Client.
 	GetClient() kv.Client
 
+	// GetClient gets a kv.Client.
+	GetMPPClient() kv.MPPClient
+
 	// SetValue saves a value associated with this context for key.
 	SetValue(key fmt.Stringer, value interface{})
 
@@ -52,6 +69,8 @@ type Context interface {
 	// ClearValue clears the value associated with this context for key.
 	ClearValue(key fmt.Stringer)
 
+	GetInfoSchema() InfoschemaMetaVersion
+
 	GetSessionVars() *variable.SessionVars
 
 	GetSessionManager() util.SessionManager
@@ -60,6 +79,10 @@ type Context interface {
 	// and creates a new transaction.
 	// now just for load data and batch insert.
 	RefreshTxnCtx(context.Context) error
+
+	// RefreshVars refreshes modified global variable to current session.
+	// only used to daemon session like `statsHandle` to detect global variable change.
+	RefreshVars(context.Context) error
 
 	// InitTxnWithStartTS initializes a transaction with startTS.
 	// It should be called right before we builds an executor.
@@ -78,13 +101,11 @@ type Context interface {
 	HasDirtyContent(tid int64) bool
 
 	// StmtCommit flush all changes by the statement to the underlying transaction.
-	StmtCommit(tracker *memory.Tracker) error
+	StmtCommit()
 	// StmtRollback provides statement level rollback.
 	StmtRollback()
 	// StmtGetMutation gets the binlog mutation for current statement.
 	StmtGetMutation(int64) *binlog.TableMutation
-	// StmtAddDirtyTableOP adds the dirty table operation for current statement.
-	StmtAddDirtyTableOP(op int, physicalID int64, handle int64)
 	// DDLOwnerChecker returns owner.DDLOwnerChecker.
 	DDLOwnerChecker() owner.DDLOwnerChecker
 	// AddTableLock adds table lock to the session lock map.
@@ -103,6 +124,10 @@ type Context interface {
 	HasLockedTables() bool
 	// PrepareTSFuture uses to prepare timestamp by future.
 	PrepareTSFuture(ctx context.Context)
+	// StoreIndexUsage stores the index usage information.
+	StoreIndexUsage(tblID int64, idxID int64, rowsSelected int64)
+	// GetTxnWriteThroughputSLI returns the TxnWriteThroughputSLI.
+	GetTxnWriteThroughputSLI() *sli.TxnWriteThroughputSLI
 }
 
 type basicCtxType int
@@ -129,12 +154,40 @@ const (
 	LastExecuteDDL basicCtxType = 3
 )
 
-type connIDCtxKeyType struct{}
+// ValidateSnapshotReadTS strictly validates that readTS does not exceed the PD timestamp
+func ValidateSnapshotReadTS(ctx context.Context, sctx Context, readTS uint64) error {
+	latestTS, err := sctx.GetStore().GetOracle().GetLowResolutionTimestamp(ctx, &oracle.Option{TxnScope: oracle.GlobalTxnScope})
+	// If we fail to get latestTS or the readTS exceeds it, get a timestamp from PD to double check
+	if err != nil || readTS > latestTS {
+		metrics.ValidateReadTSFromPDCount.Inc()
+		currentVer, err := sctx.GetStore().CurrentVersion(oracle.GlobalTxnScope)
+		if err != nil {
+			return errors.Errorf("fail to validate read timestamp: %v", err)
+		}
+		if readTS > currentVer.Ver {
+			return errors.Errorf("cannot set read timestamp to a future time")
+		}
+	}
+	return nil
+}
 
-// ConnID is the key in context.
-var ConnID = connIDCtxKeyType{}
+// How far future from now ValidateStaleReadTS allows at most
+const allowedTimeFromNow = 100 * time.Millisecond
 
-// SetCommitCtx sets the variables for context before commit a transaction.
-func SetCommitCtx(ctx context.Context, sessCtx Context) context.Context {
-	return context.WithValue(ctx, ConnID, sessCtx.GetSessionVars().ConnectionID)
+// ValidateStaleReadTS validates that readTS does not exceed the current time not strictly.
+func ValidateStaleReadTS(ctx context.Context, sctx Context, readTS uint64) error {
+	currentTS, err := sctx.GetStore().GetOracle().GetStaleTimestamp(ctx, oracle.GlobalTxnScope, 0)
+	// If we fail to calculate currentTS from local time, fallback to get a timestamp from PD
+	if err != nil {
+		metrics.ValidateReadTSFromPDCount.Inc()
+		currentVer, err := sctx.GetStore().CurrentVersion(oracle.GlobalTxnScope)
+		if err != nil {
+			return errors.Errorf("fail to validate read timestamp: %v", err)
+		}
+		currentTS = currentVer.Ver
+	}
+	if oracle.GetTimeFromTS(readTS).After(oracle.GetTimeFromTS(currentTS).Add(allowedTimeFromNow)) {
+		return errors.Errorf("cannot set read timestamp to a future time")
+	}
+	return nil
 }

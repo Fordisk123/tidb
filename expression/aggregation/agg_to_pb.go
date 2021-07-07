@@ -26,7 +26,10 @@ import (
 
 // AggFuncToPBExpr converts aggregate function to pb.
 func AggFuncToPBExpr(sc *stmtctx.StatementContext, client kv.Client, aggFunc *AggFuncDesc) *tipb.Expr {
-	if aggFunc.HasDistinct {
+	// if aggFunc.HasDistinct {
+	// do nothing and ignore aggFunc.HasDistinct
+	// }
+	if len(aggFunc.OrderByItems) > 0 {
 		return nil
 	}
 	pc := expression.NewPBConverter(client, sc)
@@ -34,6 +37,8 @@ func AggFuncToPBExpr(sc *stmtctx.StatementContext, client kv.Client, aggFunc *Ag
 	switch aggFunc.Name {
 	case ast.AggFuncCount:
 		tp = tipb.ExprType_Count
+	case ast.AggFuncApproxCountDistinct:
+		tp = tipb.ExprType_ApproxCountDistinct
 	case ast.AggFuncFirstRow:
 		tp = tipb.ExprType_First
 	case ast.AggFuncGroupConcat:
@@ -56,6 +61,12 @@ func AggFuncToPBExpr(sc *stmtctx.StatementContext, client kv.Client, aggFunc *Ag
 		tp = tipb.ExprType_VarPop
 	case ast.AggFuncJsonObjectAgg:
 		tp = tipb.ExprType_JsonObjectAgg
+	case ast.AggFuncStddevPop:
+		tp = tipb.ExprType_StddevPop
+	case ast.AggFuncVarSamp:
+		tp = tipb.ExprType_VarSamp
+	case ast.AggFuncStddevSamp:
+		tp = tipb.ExprType_StddevSamp
 	}
 	if !client.IsRequestTypeSupported(kv.ReqTypeSelect, int64(tp)) {
 		return nil
@@ -69,7 +80,7 @@ func AggFuncToPBExpr(sc *stmtctx.StatementContext, client kv.Client, aggFunc *Ag
 		}
 		children = append(children, pbArg)
 	}
-	return &tipb.Expr{Tp: tp, Children: children, FieldType: expression.ToPBFieldType(aggFunc.RetTp)}
+	return &tipb.Expr{Tp: tp, Children: children, FieldType: expression.ToPBFieldType(aggFunc.RetTp), HasDistinct: aggFunc.HasDistinct}
 }
 
 // PBExprToAggFuncDesc converts pb to aggregate function.
@@ -78,6 +89,8 @@ func PBExprToAggFuncDesc(ctx sessionctx.Context, aggFunc *tipb.Expr, fieldTps []
 	switch aggFunc.Tp {
 	case tipb.ExprType_Count:
 		name = ast.AggFuncCount
+	case tipb.ExprType_ApproxCountDistinct:
+		name = ast.AggFuncApproxCountDistinct
 	case tipb.ExprType_First:
 		name = ast.AggFuncFirstRow
 	case tipb.ExprType_GroupConcat:

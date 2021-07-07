@@ -82,7 +82,8 @@ func (s *testMyDecimalSuite) TestToInt(c *C) {
 	}
 	for _, tt := range tests {
 		var dec MyDecimal
-		dec.FromString([]byte(tt.input))
+		err := dec.FromString([]byte(tt.input))
+		c.Assert(err, IsNil)
 		result, ec := dec.ToInt()
 		c.Check(ec, Equals, tt.err)
 		c.Check(result, Equals, tt.output)
@@ -106,7 +107,8 @@ func (s *testMyDecimalSuite) TestToUint(c *C) {
 	}
 	for _, tt := range tests {
 		var dec MyDecimal
-		dec.FromString([]byte(tt.input))
+		err := dec.FromString([]byte(tt.input))
+		c.Assert(err, IsNil)
 		result, ec := dec.ToUint()
 		c.Check(ec, Equals, tt.err)
 		c.Check(result, Equals, tt.output)
@@ -141,10 +143,19 @@ func (s *testMyDecimalSuite) TestToFloat(c *C) {
 		{"-123.45", -123.45},
 		{"0.00012345000098765", 0.00012345000098765},
 		{"1234500009876.5", 1234500009876.5},
+		{"1e39", 1e39},
+		{"1e-39", 1e-39},
+		{"1e00", 1},
+		{"1e001", 10},
+		{"-9223372036854775807", -9223372036854775807},
+		{"-9223372036854775808", -9223372036854775808},
+		{"18446744073709551615", 18446744073709551615},
+		{"123456789.987654321", 123456789.987654321},
 	}
 	for _, ca := range tests {
 		var dec MyDecimal
-		dec.FromString([]byte(ca.s))
+		err := dec.FromString([]byte(ca.s))
+		c.Assert(err, IsNil)
 		f, err := dec.ToFloat64()
 		c.Check(err, IsNil)
 		c.Check(f, Equals, ca.f)
@@ -157,7 +168,7 @@ func (s *testMyDecimalSuite) TestToHashKey(c *C) {
 	}{
 		{[]string{"1.1", "1.1000", "1.1000000", "1.10000000000", "01.1", "0001.1", "001.1000000"}},
 		{[]string{"-1.1", "-1.1000", "-1.1000000", "-1.10000000000", "-01.1", "-0001.1", "-001.1000000"}},
-		{[]string{".1", "0.1", "000000.1", ".10000", "0000.10000", "000000000000000000.1"}},
+		{[]string{".1", "0.1", "0.10", "000000.1", ".10000", "0000.10000", "000000000000000000.1"}},
 		{[]string{"0", "0000", ".0", ".00000", "00000.00000", "-0", "-0000", "-.0", "-.00000", "-00000.00000"}},
 		{[]string{".123456789123456789", ".1234567891234567890", ".12345678912345678900", ".123456789123456789000", ".1234567891234567890000", "0.123456789123456789",
 			".1234567891234567890000000000", "0000000.123456789123456789000"}},
@@ -208,6 +219,8 @@ func (s *testMyDecimalSuite) TestToHashKey(c *C) {
 			var dec MyDecimal
 			c.Check(dec.FromString([]byte(num)), IsNil)
 			key, err := dec.ToHashKey()
+			// remove digit len
+			key = key[:len(key)-1]
 			c.Check(err, IsNil)
 			keys = append(keys, string(key))
 		}
@@ -400,9 +413,10 @@ func (s *testMyDecimalSuite) TestRoundWithHalfEven(c *C) {
 
 	for _, ca := range tests {
 		var dec MyDecimal
-		dec.FromString([]byte(ca.input))
+		err := dec.FromString([]byte(ca.input))
+		c.Assert(err, IsNil)
 		var rounded MyDecimal
-		err := dec.Round(&rounded, ca.scale, ModeHalfEven)
+		err = dec.Round(&rounded, ca.scale, ModeHalfEven)
 		c.Check(err, Equals, ca.err)
 		result := rounded.ToString()
 		c.Check(string(result), Equals, ca.output)
@@ -434,9 +448,10 @@ func (s *testMyDecimalSuite) TestRoundWithTruncate(c *C) {
 	}
 	for _, ca := range tests {
 		var dec MyDecimal
-		dec.FromString([]byte(ca.input))
+		err := dec.FromString([]byte(ca.input))
+		c.Assert(err, IsNil)
 		var rounded MyDecimal
-		err := dec.Round(&rounded, ca.scale, ModeTruncate)
+		err = dec.Round(&rounded, ca.scale, ModeTruncate)
 		c.Check(err, Equals, ca.err)
 		result := rounded.ToString()
 		c.Check(string(result), Equals, ca.output)
@@ -469,9 +484,10 @@ func (s *testMyDecimalSuite) TestRoundWithCeil(c *C) {
 	}
 	for _, ca := range tests {
 		var dec MyDecimal
-		dec.FromString([]byte(ca.input))
+		err := dec.FromString([]byte(ca.input))
+		c.Assert(err, IsNil)
 		var rounded MyDecimal
-		err := dec.Round(&rounded, ca.scale, modeCeiling)
+		err = dec.Round(&rounded, ca.scale, modeCeiling)
 		c.Check(err, Equals, ca.err)
 		result := rounded.ToString()
 		c.Check(string(result), Equals, ca.output)
@@ -506,6 +522,7 @@ func (s *testMyDecimalSerialSuite) TestFromString(c *C) {
 		{"1e 1dddd ", "10", ErrTruncated},
 		{"1e - 1", "1", ErrTruncated},
 		{"1e -1", "0.1", nil},
+		{"0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "0.000000000000000000000000000000000000000000000000000000000000000000000000", ErrTruncated},
 	}
 	for _, ca := range tests {
 		var dec MyDecimal
@@ -541,7 +558,8 @@ func (s *testMyDecimalSuite) TestToString(c *C) {
 	}
 	for _, ca := range tests {
 		var dec MyDecimal
-		dec.FromString([]byte(ca.input))
+		err := dec.FromString([]byte(ca.input))
+		c.Assert(err, IsNil)
 		result := dec.ToString()
 		c.Check(string(result), Equals, ca.output)
 	}
@@ -571,6 +589,22 @@ func (s *testMyDecimalSuite) TestToBinFromBin(c *C) {
 		{"000000000.01", 7, 3, "0.010", nil},
 		{"123.4", 10, 2, "123.40", nil},
 		{"1000", 3, 0, "0", ErrOverflow},
+		{"0.1", 1, 1, "0.1", nil},
+		{"0.100", 1, 1, "0.1", ErrTruncated},
+		{"0.1000", 1, 1, "0.1", ErrTruncated},
+		{"0.10000", 1, 1, "0.1", ErrTruncated},
+		{"0.100000", 1, 1, "0.1", ErrTruncated},
+		{"0.1000000", 1, 1, "0.1", ErrTruncated},
+		{"0.10", 1, 1, "0.1", ErrTruncated},
+		{"0000000000000000000000000000000000000000000.000000000000123000000000000000", 15, 15, "0.000000000000123", ErrTruncated},
+		{"00000000000000000000000000000.00000000000012300", 15, 15, "0.000000000000123", ErrTruncated},
+		{"0000000000000000000000000000000000000000000.0000000000001234000000000000000", 16, 16, "0.0000000000001234", ErrTruncated},
+		{"00000000000000000000000000000.000000000000123400", 16, 16, "0.0000000000001234", ErrTruncated},
+		{"0.1", 2, 2, "0.10", nil},
+		{"0.10", 3, 3, "0.100", nil},
+		{"0.1", 3, 1, "0.1", nil},
+		{"0.0000000000001234", 32, 17, "0.00000000000012340", nil},
+		{"0.0000000000001234", 20, 20, "0.00000000000012340000", nil},
 	}
 	for _, ca := range tests {
 		var dec MyDecimal
@@ -622,8 +656,10 @@ func (s *testMyDecimalSuite) TestCompare(c *C) {
 	}
 	for _, tt := range tests {
 		var a, b MyDecimal
-		a.FromString([]byte(tt.a))
-		b.FromString([]byte(tt.b))
+		err := a.FromString([]byte(tt.a))
+		c.Assert(err, IsNil)
+		err = b.FromString([]byte(tt.b))
+		c.Assert(err, IsNil)
 		c.Assert(a.Compare(&b), Equals, tt.cmp)
 	}
 }
@@ -663,12 +699,11 @@ func (s *testMyDecimalSuite) TestNeg(c *C) {
 	type testCase struct {
 		a      string
 		result string
-		err    error
 	}
 	tests := []testCase{
-		{"-0.0000000000000000000000000000000000000000000000000017382578996420603", "0.0000000000000000000000000000000000000000000000000017382578996420603", nil},
-		{"-13890436710184412000000000000000000000000000000000000000000000000000000000000", "13890436710184412000000000000000000000000000000000000000000000000000000000000", nil},
-		{"0", "0", nil},
+		{"-0.0000000000000000000000000000000000000000000000000017382578996420603", "0.0000000000000000000000000000000000000000000000000017382578996420603"},
+		{"-13890436710184412000000000000000000000000000000000000000000000000000000000000", "13890436710184412000000000000000000000000000000000000000000000000000000000000"},
+		{"0", "0"},
 	}
 	for _, tt := range tests {
 		a := NewDecFromStringForTest(tt.a)
@@ -740,9 +775,11 @@ func (s *testMyDecimalSuite) TestSub(c *C) {
 	}
 	for _, tt := range tests {
 		var a, b, sum MyDecimal
-		a.FromString([]byte(tt.a))
-		b.FromString([]byte(tt.b))
-		err := DecimalSub(&a, &b, &sum)
+		err := a.FromString([]byte(tt.a))
+		c.Assert(err, IsNil)
+		err = b.FromString([]byte(tt.b))
+		c.Assert(err, IsNil)
+		err = DecimalSub(&a, &b, &sum)
 		c.Assert(err, Equals, tt.err)
 		result := sum.ToString()
 		c.Assert(string(result), Equals, tt.result)
@@ -772,9 +809,11 @@ func (s *testMyDecimalSuite) TestMul(c *C) {
 	}
 	for _, tt := range tests {
 		var a, b, product MyDecimal
-		a.FromString([]byte(tt.a))
-		b.FromString([]byte(tt.b))
-		err := DecimalMul(&a, &b, &product)
+		err := a.FromString([]byte(tt.a))
+		c.Assert(err, IsNil)
+		err = b.FromString([]byte(tt.b))
+		c.Assert(err, IsNil)
+		err = DecimalMul(&a, &b, &product)
 		c.Check(err, Equals, tt.err)
 		result := product.String()
 		c.Assert(result, Equals, tt.result)
@@ -807,9 +846,11 @@ func (s *testMyDecimalSuite) TestDivMod(c *C) {
 	}
 	for _, tt := range tests {
 		var a, b, to MyDecimal
-		a.FromString([]byte(tt.a))
-		b.FromString([]byte(tt.b))
-		err := DecimalDiv(&a, &b, &to, 5)
+		err := a.FromString([]byte(tt.a))
+		c.Assert(err, IsNil)
+		err = b.FromString([]byte(tt.b))
+		c.Assert(err, IsNil)
+		err = DecimalDiv(&a, &b, &to, 5)
 		c.Check(err, Equals, tt.err)
 		if tt.err == ErrDivByZero {
 			continue
@@ -830,8 +871,10 @@ func (s *testMyDecimalSuite) TestDivMod(c *C) {
 	}
 	for _, tt := range tests {
 		var a, b, to MyDecimal
-		a.FromString([]byte(tt.a))
-		b.FromString([]byte(tt.b))
+		err := a.FromString([]byte(tt.a))
+		c.Assert(err, IsNil)
+		err = b.FromString([]byte(tt.b))
+		c.Assert(err, IsNil)
 		ec := DecimalMod(&a, &b, &to)
 		c.Check(ec, Equals, tt.err)
 		if tt.err == ErrDivByZero {
@@ -851,8 +894,10 @@ func (s *testMyDecimalSuite) TestDivMod(c *C) {
 	}
 	for _, tt := range tests {
 		var a, b, to MyDecimal
-		a.FromString([]byte(tt.a))
-		b.FromString([]byte(tt.b))
+		err := a.FromString([]byte(tt.a))
+		c.Assert(err, IsNil)
+		err = b.FromString([]byte(tt.b))
+		c.Assert(err, IsNil)
 		ec := DecimalDiv(&a, &b, &to, DivFracIncr)
 		c.Check(ec, Equals, tt.err)
 		if tt.err == ErrDivByZero {
@@ -869,8 +914,10 @@ func (s *testMyDecimalSuite) TestDivMod(c *C) {
 	}
 	for _, tt := range tests {
 		var a, b, to MyDecimal
-		a.FromString([]byte(tt.a))
-		b.FromString([]byte(tt.b))
+		err := a.FromString([]byte(tt.a))
+		c.Assert(err, IsNil)
+		err = b.FromString([]byte(tt.b))
+		c.Assert(err, IsNil)
 		ec := DecimalMod(&a, &b, &to)
 		c.Check(ec, Equals, tt.err)
 		if tt.err == ErrDivByZero {

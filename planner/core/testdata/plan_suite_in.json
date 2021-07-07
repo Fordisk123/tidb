@@ -31,24 +31,37 @@
       "select /*+ USE_INDEX(test.t, c_d_e) */ * from t",
       "select /*+ IGNORE_INDEX(t, c_d_e) */ c from t order by c",
       "select /*+ IGNORE_INDEX(test.t, c_d_e) */ c from t order by c",
+      "select /*+ FORCE_INDEX(t, c_d_e) */ * from t",
+      "select /*+ FORCE_INDEX(test.t, c_d_e) */ * from t",
       "select /*+ USE_INDEX(t, c_d_e) */ * from t t1",
       "select /*+ IGNORE_INDEX(t, c_d_e) */ t1.c from t t1 order by t1.c",
+      "select /*+ FORCE_INDEX(t, c_d_e) */ * from t t1",
       "select /*+ USE_INDEX(t1, c_d_e) */ * from t t1",
       "select /*+ IGNORE_INDEX(t1, c_d_e) */ t1.c from t t1 order by t1.c",
+      "select /*+ FORCE_INDEX(t1, c_d_e) */ * from t t1",
       "select /*+ USE_INDEX(t1, c_d_e), USE_INDEX(t2, f) */ * from t t1, t t2 where t1.a = t2.b",
       "select /*+ IGNORE_INDEX(t1, c_d_e), IGNORE_INDEX(t2, f), HASH_JOIN(t1) */ * from t t1, t t2 where t1.a = t2.b",
+      "select /*+ FORCE_INDEX(t1, c_d_e), FORCE_INDEX(t2, f) */ * from t t1, t t2 where t1.a = t2.b",
       // test multiple indexes
       "select /*+ USE_INDEX(t, c_d_e, f, g) */ * from t order by f",
+      "select /*+ FORCE_INDEX(t, c_d_e, f, g) */ * from t order by f",
       // use TablePath when the hint only contains table.
       "select /*+ USE_INDEX(t) */ f from t where f > 10",
+      "select /*+ FORCE_INDEX(t) */ f from t where f > 10",
       // there will be a warning instead of error when index not exist
       "select /*+ USE_INDEX(t, no_such_index) */ * from t",
       "select /*+ IGNORE_INDEX(t, no_such_index) */ * from t",
+      "select /*+ FORCE_INDEX(t, no_such_index) */ * from t",
       // use both use_index and ignore_index, same as index hints in sql.
       "select /*+ USE_INDEX(t, c_d_e), IGNORE_INDEX(t, f) */ c from t order by c",
       "select /*+ USE_INDEX(t, f), IGNORE_INDEX(t, f) */ c from t order by c",
       "select /*+ USE_INDEX(t, c_d_e), IGNORE_INDEX(t, c_d_e) */ c from t order by c",
-      "select /*+ USE_INDEX(t, c_d_e, f), IGNORE_INDEX(t, c_d_e) */ c from t order by c"
+      "select /*+ USE_INDEX(t, c_d_e, f), IGNORE_INDEX(t, c_d_e) */ c from t order by c",
+      // use both force_index and ignore_index, same as index hints in sql.
+      "select /*+ FORCE_INDEX(t, c_d_e), IGNORE_INDEX(t, f) */ c from t order by c",
+      "select /*+ FORCE_INDEX(t, f), IGNORE_INDEX(t, f) */ c from t order by c",
+      "select /*+ FORCE_INDEX(t, c_d_e), IGNORE_INDEX(t, c_d_e) */ c from t order by c",
+      "select /*+ FORCE_INDEX(t, c_d_e, f), IGNORE_INDEX(t, c_d_e) */ c from t order by c"
     ]
   },
   {
@@ -57,7 +70,12 @@
       "select /*+ USE_INDEX_MERGE(t, c_d_e, f_g) */ * from t where c < 1 or f > 2",
       "select /*+ USE_INDEX_MERGE(t, primary, f_g) */ * from t where a < 1 or f > 2",
       "select /*+ USE_INDEX_MERGE(t, primary, f_g, c_d_e) */ * from t where a < 1 or f > 2",
-      "select /*+ NO_INDEX_MERGE(), USE_INDEX_MERGE(t, primary, f_g, c_d_e) */ * from t where a < 1 or f > 2"
+      "select /*+ NO_INDEX_MERGE(), USE_INDEX_MERGE(t, primary, f_g, c_d_e) */ * from t where a < 1 or f > 2",
+      "select /*+ USE_INDEX_MERGE(t1, c_d_e, f_g) */ * from t where c < 1 or f > 2",
+      "select /*+ NO_INDEX_MERGE(), USE_INDEX_MERGE(t, primary, f_g, c_d_e) */ * from t where a < 1 or f > 2",
+      "select /*+ USE_INDEX_MERGE(t) USE_INDEX_MERGE(t) */ * from t where c < 1 or f > 2",
+      "select /*+ USE_INDEX_MERGE(db2.t) */ * from t where c < 1 or f > 2",
+      "select /*+ USE_INDEX_MERGE(db2.t, c_d_e, f_g) */ * from t where c < 1 or f > 2"
     ]
   },
   {
@@ -121,7 +139,10 @@
       "select * from ((SELECT 1 a,6 b) UNION (SELECT 2,5) UNION (SELECT 2, 4) ORDER BY 1) t order by 1, 2",
       "select * from (select *, NULL as xxx from t) t order by xxx",
       "select * from t use index(f) where f = 1 and a = 1",
-      "select * from t2 use index(b) where b = 1 and a = 1"
+      "select * from t2 use index(b) where b = 1 and a = 1",
+      // Test inline project for Limit
+      "select f from t where a > 1",
+      "select f from t where a > 1 limit 10"
     ]
   },
   {
@@ -242,8 +263,8 @@
       // Test join hint for delete and update
       "delete /*+ TIDB_INLJ(t1, t2) */ t1 from t t1, t t2 where t1.c=t2.c",
       "delete /*+ TIDB_SMJ(t1, t2) */ from t1 using t t1, t t2 where t1.c=t2.c",
-      "update /*+ TIDB_SMJ(t1, t2) */ t t1, t t2 set t1.a=1, t2.a=1 where t1.a=t2.a",
-      "update /*+ TIDB_HJ(t1, t2) */ t t1, t t2 set t1.a=1, t2.a=1 where t1.a=t2.a",
+      "update /*+ TIDB_SMJ(t1, t2) */ t t1, t t2 set t1.c=1, t2.c=1 where t1.a=t2.a",
+      "update /*+ TIDB_HJ(t1, t2) */ t t1, t t2 set t1.c=1, t2.c=1 where t1.a=t2.a",
       // Test complex delete.
       "delete from t where b < 1 order by d limit 1",
       // Test simple delete.
@@ -487,21 +508,32 @@
       [
         "insert into t values(1, 1)",
         // Test Index Join + UnionScan + TableScan.
-        "explain select /*+ TIDB_INLJ(t2) */ * from t t1, t t2 where t1.a = t2.a"
+        "explain format = 'brief' select /*+ TIDB_INLJ(t2) */ * from t t1, t t2 where t1.a = t2.a"
       ],
       [
         "insert into t values(1, 1)",
         // Test Index Join + UnionScan + DoubleRead.
-        "explain select /*+ TIDB_INLJ(t2) */ * from t t1, t t2 where t1.a = t2.b"
+        "explain format = 'brief' select /*+ TIDB_INLJ(t2) */ * from t t1, t t2 where t1.a = t2.b"
       ],
       [
         "insert into t values(1, 1)",
         // Test Index Join + UnionScan + IndexScan.
-        "explain select /*+ TIDB_INLJ(t2) */ t1.a , t2.b from t t1, t t2 where t1.a = t2.b"
+        "explain format = 'brief' select /*+ TIDB_INLJ(t2) */ t1.a , t2.b from t t1, t t2 where t1.a = t2.b"
       ],
       [
         "insert into tt values(1)",
-        "explain select /*+ TIDB_INLJ(t2) */ * from tt t1, tt t2 where t1.a = t2.a"
+        "explain format = 'brief' select /*+ TIDB_INLJ(t2) */ * from tt t1, tt t2 where t1.a = t2.a"
+      ]
+    ]
+  },
+  {
+    "name": "TestMergeJoinUnionScan",
+    "cases": [
+      [
+        "insert into t2 values (11, 'amazing merkle')",
+        "insert into t2 values (12, 'amazing merkle')",
+        // Test Merge Join + UnionScan + TableScan.
+        "explain format = 'brief' select /*+ MERGE_JOIN(t1,t2) */ * from t1, t2 where t1.c_int = t2.c_int and t1.c_int = t2.c_int order by t1.c_int, t2.c_str;"
       ]
     ]
   },
@@ -516,7 +548,10 @@
     "cases": [
       "select /*+ INL_JOIN(t1) */ * from t1 join t2 on t1.a = t2.a;",
       "select /*+ INL_HASH_JOIN(t1) */ * from t1 join t2 on t1.a = t2.a;",
-      "select /*+ INL_MERGE_JOIN(t1) */ * from t1 join t2 on t1.a = t2.a;"
+      "select /*+ INL_MERGE_JOIN(t1) */ * from t1 join t2 on t1.a = t2.a;",
+      // Issue 15484
+      "select /*+ inl_merge_join(t2) */ t1.a, t2.a from t t1 left join t t2 use index(g_2) on t1.g=t2.g",
+      "select /*+inl_merge_join(t2)*/ t1.a, t2.a from t t1 left join t t2 use index(g_2) on t1.g=t2.g order by t1.a"
     ]
   },
   {
@@ -526,6 +561,66 @@
       "select /*+ AGG_TO_COP(), USE_INDEX(t) */ sum(b) from ta group by b",
       "select /*+ AGG_TO_COP(), HASH_AGG(), USE_INDEX(t) */ distinct a from ta group by a",
       "select /*+ AGG_TO_COP(), HASH_AGG(), HASH_JOIN(t1), USE_INDEX(t1), USE_INDEX(t2) */ sum(t1.a) from ta t1, ta t2 where t1.a = t2.b group by t1.a"
+    ]
+  },
+  {
+    "name": "TestLimitToCopHint",
+    "cases": [
+      "select /*+ LIMIT_TO_COP() */ * from tn where a = 1 and b > 10 and b < 20 and c > 50 order by d limit 1",
+      "select * from tn where a = 1 and b > 10 and b < 20 and c > 50 order by d limit 1",
+      "select /*+ LIMIT_TO_COP() */ a from tn where mod(a, 2) order by a limit 1",
+      "select /*+ LIMIT_TO_COP() */ a from tn where a > 10 limit 1"
+    ]
+  },
+  {
+    "name": "TestPushdownDistinctEnable",
+    "cases": [
+      "select /*+ HASH_AGG() */ avg(distinct a) from t;", // InjectProjBelowAgg
+      "select /*+ HASH_AGG() */ a, count(distinct a) from t;", // firstrow(a) cannot be removed.
+      "select /*+ HASH_AGG() */ avg(b), c, avg(b), count(distinct A, B),  count(distinct A), count(distinct c), sum(b) from t group by c;",
+      "select /*+ STREAM_AGG() */ count(distinct c) from t group by c;", // can push down
+      "select /*+ STREAM_AGG() */ count(distinct c) from t;", // can not push down because c is not in group by
+      "select /*+ HASH_AGG() */ count(distinct c) from t;", // can push down
+      "select count(distinct c) from t group by c;",
+      "select count(distinct c) from t;", // should not use streamAgg because c is not in group by
+
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ sum(distinct b) from pt;",
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ count(distinct a) from (select * from ta union all select * from tb) t;",
+
+      "select distinct DATE_FORMAT(timestamp, '%Y-%m-%d %H') as tt from tc ;"
+    ]
+  },
+  {
+    "name": "TestPushdownDistinctDisable",
+    "cases": [
+      // do not pushdown even AGG_TO_COP is specified.
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ avg(distinct a) from t;",
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ a, count(distinct a) from t;",
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ avg(b), c, avg(b), count(distinct A, B),  count(distinct A), count(distinct c), sum(b) from t group by c;",
+      "select /*+ STREAM_AGG(), AGG_TO_COP() */ count(distinct c) from t group by c;",
+      "select /*+ STREAM_AGG(), AGG_TO_COP() */ count(distinct c) from t;",
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ count(distinct c) from t;",
+      "select /*+ AGG_TO_COP() */ count(distinct c) from t group by c;",
+
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ sum(distinct b) from pt;",
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ count(distinct a) from (select * from ta union all select * from tb) t;"
+    ]
+  },
+  {
+    "name": "TestPushdownDistinctEnableAggPushDownDisable",
+    "cases": [
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ sum(distinct b) from pt;",
+      "select /*+ HASH_AGG(), AGG_TO_COP() */ count(distinct a) from (select * from ta union all select * from tb) t;",
+      "select distinct DATE_FORMAT(timestamp, '%Y-%m-%d %H') as tt from tc ;"
+    ]
+  },
+  {
+    "name": "TestGroupConcatOrderby",
+    "cases": [
+      "select /*+ agg_to_cop */ group_concat(name ORDER BY name desc SEPARATOR '++'), group_concat(id ORDER BY name desc, id asc SEPARATOR '--') from test;",
+      "select /*+ agg_to_cop */ group_concat(name ORDER BY name desc SEPARATOR '++'), group_concat(id ORDER BY name desc, id asc SEPARATOR '--') from ptest;",
+      "select /*+ agg_to_cop */ group_concat(distinct name order by name desc) from test;",
+      "select /*+ agg_to_cop */ group_concat(distinct name order by name desc) from ptest;"
     ]
   },
   {
@@ -567,13 +662,59 @@
       "select 1 from (select /*+ HASH_JOIN(t1) */ t1.a not in (select t2.a from t2) from t1) x;",
       "select /*+ INL_JOIN(t1) */ t1.b, t2.b from t1 inner join t2 on t1.a = t2.a;",
       "select /*+ INL_HASH_JOIN(t1) */ t1.b, t2.b from t1 inner join t2 on t1.a = t2.a;",
-      "select /*+ INL_MERGE_JOIN(t1) */ t1.b, t2.b from t1 inner join t2 on t1.a = t2.a;"
+      "select /*+ INL_MERGE_JOIN(t1) */ t1.b, t2.b from t1 inner join t2 on t1.a = t2.a;",
+      "select /*+ MERGE_JOIN(t1) */ t1.b, t2.b from t1 inner join t2 on t1.a = t2.a;"
     ]
   },
   {
     "name": "TestHintFromDiffDatabase",
     "cases": [
       "select /*+ inl_hash_join(test.t1) */ * from test.t2 join test.t1 on test.t2.a = test.t1.a"
+    ]
+  },
+  {
+    "name": "TestNthPlanHintWithExplain",
+    "cases": [
+      "select /*+nth_plan(1)*/ * from test.tt where a=1 and b=1",
+      "select /*+nth_plan(2)*/ * from test.tt where a=1 and b=1;",
+      "select /*+nth_plan(3)*/ * from test.tt where a=1 and b=1;",
+      "select /*+nth_plan(2)*/ * from test.tt where a=1 and b=1;",
+      "select * from test.tt where a=1 and b=1"
+    ]
+  },
+  {
+    "name": "TestEliminateMaxOneRow",
+    "cases": [
+      "select a from t2 where t2.a < (select t1.a from t1 where t1.a = t2.a);",
+      "select a from t2 where t2.a < (select t1.a from t1 where t1.b = t2.b and t1.a is null);",
+      "select a from t2 where t2.a < (select t3.a from t3 where t3.a = t2.a);"
+    ]
+  },
+  {
+    "name": "TestEnumIndex",
+    "cases": [
+      "select e from t where e = 'b'",
+      "select e from t where e != 'b'",
+      "select e from t where e > 'b'",
+      "select e from t where e >= 'b'",
+      "select e from t where e < 'b'",
+      "select e from t where e <= 'b'",
+      "select e from t where e = 2",
+      "select e from t where e != 2",
+      "select e from t where e > 2",
+      "select e from t where e >= 2",
+      "select e from t where e < 2",
+      "select e from t where e <= 2",
+
+      // Out of range
+      "select e from t where e > ''",
+      "select e from t where e > 'd'",
+      "select e from t where e > -1",
+      "select e from t where e > 5",
+
+      // zero-value
+      "select e from t where e = ''",
+      "select e from t where e != ''"
     ]
   }
 ]

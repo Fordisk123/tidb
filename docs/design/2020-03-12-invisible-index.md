@@ -6,7 +6,7 @@
 
 ## Abstract
 
-MySQL supports [Invisible indexes](https://dev.mysql.com/doc/refman/8.0/en/invisible-indexes.html); that is, indexes that are not used by the optimizer. 
+MySQL supports [invisible indexes](https://dev.mysql.com/doc/refman/8.0/en/invisible-indexes.html); that is, indexes that are not used by the optimizer. 
 
 This is a useful feature for dropping an index in a safe way. Invisible indexes make it possible to test the effect of removing an index on query performance, without making a destructive change that must be undone should the index turn out to be required. Dropping and re-adding an index can be expensive for a large table, whereas making it invisible and visible are fast, in-place operations.
 
@@ -21,7 +21,7 @@ index_option:
     {VISIBLE | INVISIBLE}
 ```
 
-Also, consider the following:
+Also, the following behaviors need to be supported as well:
 
 - Display information about invisible indexes in the output of `INFORMATION_SCHEMA.STATISTICS` or `SHOW INDEX`.
 - Index hints need to report errors when used in invisible indexes.
@@ -33,7 +33,7 @@ Index has a great influence on the performance of the database. Whether there is
 
 ## Proposal
 
-Adding an option (visible or not) to the index. If it is not visible, it's called **Invisible Index**. Invisible Index cannot be used by the optimizer (with the `use_invisible_indexes` switch on), but the index is maintained during DML operations. For a query statement, invisible index has the same effect as ignoring the index through Index Hint.
+Adding an option (visible or not) to the index. If it is not visible, it's called **Invisible Index**. Invisible indexes cannot be used by the optimizer (with the `use_invisible_indexes` switch on), but the index is maintained during DML operations. For a query statement, invisible indexes have the same effect as ignoring the index through Index Hint.
 
 The option `INVISIBLE` of an index can be changed by using the following DDL statement:
 
@@ -41,7 +41,7 @@ The option `INVISIBLE` of an index can be changed by using the following DDL sta
 ALTER TABLE table_name ALTER INDEX index_name { INVISIBLE | VISIBLE };
 ```
 
-Or set option `INVISIBLE` when creating an index:
+Or by setting option `INVISIBLE` when creating an index:
 
 ```
 CREATE INDEX index_name ON table_name(key) [ INVISIBLE | VISIBLE ];
@@ -65,18 +65,18 @@ Another solution for implement invisible indexes is: Indicate invisibility by DD
 
 ## Compatibility and Migration Plan
 
-This the a new feature and it's absolutly compatible with old TiDB versions, also, it's not impact any data migration.
-The syntax and functions are basically compatible with MySQL. Expect one:
+This the a new feature and it's absolutely compatible with old TiDB versions, also, it does not impact any data migration.
+The syntax and functions are basically compatible with MySQL expect:
 
 	When use invisible index in `SQL Hint`, and set `use_invisible_indexes = false`, MySQL allow use the invisible index.
-	But in TiDB, It's **not allowed**, and will throw a `Unresolved name` error, Because the behavior is more reasonable.
+	But in TiDB, It's **not allowed** and an `Unresolved name` error will be thrown.
 
 ## Implementation
 
 - Add syntax support in parser
 - Add a new column `IS_VISIBLE` in `information_schema.statistics`
 - Add a new column `VISIBLE` in `SHOW INDEX FROM table` statement
-- Show invisiable column infomations in `SHOW CREATE TABLE` statement
+- Show invisible column information in `SHOW CREATE TABLE` statement
 - Add `use_invisible_indexes` in system variable `@@optimizer_switch`
 - Add new error message `ERROR 3522 (HY000): A primary key index cannot be invisible`
 - Ignore invisible index in optimizer and add unit tests
@@ -84,7 +84,7 @@ The syntax and functions are basically compatible with MySQL. Expect one:
 ## Testing Plan
 
 - Unit test
-- Port All mysql test related to invisible index
+- Learn from MySQL test cases related to invisible indexes
 
 ## Open issues
 

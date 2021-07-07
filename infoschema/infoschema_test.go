@@ -14,13 +14,18 @@
 package infoschema_test
 
 import (
-	"sync"
+	"context"
+	"strings"
 	"testing"
+
+	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/table"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/ddl/placement"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
@@ -44,15 +49,17 @@ type testSuite struct {
 
 func (*testSuite) TestT(c *C) {
 	defer testleak.AfterTest(c)()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
-	defer store.Close()
+	defer func() {
+		err := store.Close()
+		c.Assert(err, IsNil)
+	}()
 	// Make sure it calls perfschema.Init().
 	dom, err := session.BootstrapSession(store)
 	c.Assert(err, IsNil)
 	defer dom.Close()
 
-	handle := infoschema.NewHandle(store)
 	dbName := model.NewCIStr("Test")
 	tbName := model.NewCIStr("T")
 	colName := model.NewCIStr("A")
@@ -104,23 +111,24 @@ func (*testSuite) TestT(c *C) {
 	}
 
 	dbInfos := []*model.DBInfo{dbInfo}
-	err = kv.RunInNewTxn(store, true, func(txn kv.Transaction) error {
-		meta.NewMeta(txn).CreateDatabase(dbInfo)
+	err = kv.RunInNewTxn(context.Background(), store, true, func(ctx context.Context, txn kv.Transaction) error {
+		err := meta.NewMeta(txn).CreateDatabase(dbInfo)
+		c.Assert(err, IsNil)
 		return errors.Trace(err)
 	})
 	c.Assert(err, IsNil)
 
-	builder, err := infoschema.NewBuilder(handle).InitWithDBInfos(dbInfos, 1)
+	builder, err := infoschema.NewBuilder(dom.Store()).InitWithDBInfos(dbInfos, nil, 1)
 	c.Assert(err, IsNil)
 
 	txn, err := store.Begin()
 	c.Assert(err, IsNil)
 	checkApplyCreateNonExistsSchemaDoesNotPanic(c, txn, builder)
 	checkApplyCreateNonExistsTableDoesNotPanic(c, txn, builder, dbID)
-	txn.Rollback()
+	err = txn.Rollback()
+	c.Assert(err, IsNil)
 
-	builder.Build()
-	is := handle.Get()
+	is := builder.Build()
 
 	schemaNames := is.AllSchemaNames()
 	c.Assert(schemaNames, HasLen, 4)
@@ -162,6 +170,7 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(is.TableExists(dbName, tbName), IsTrue)
 	c.Assert(is.TableExists(dbName, noexist), IsFalse)
 	c.Assert(is.TableIsView(dbName, tbName), IsFalse)
+	c.Assert(is.TableIsSequence(dbName, tbName), IsFalse)
 
 	tb, ok := is.TableByID(tbID)
 	c.Assert(ok, IsTrue)
@@ -193,8 +202,9 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(tb, NotNil)
 
-	err = kv.RunInNewTxn(store, true, func(txn kv.Transaction) error {
-		meta.NewMeta(txn).CreateTableOrView(dbID, tblInfo)
+	err = kv.RunInNewTxn(context.Background(), store, true, func(ctx context.Context, txn kv.Transaction) error {
+		err := meta.NewMeta(txn).CreateTableOrView(dbID, tblInfo)
+		c.Assert(err, IsNil)
 		return errors.Trace(err)
 	})
 	c.Assert(err, IsNil)
@@ -202,15 +212,12 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(err, IsNil)
 	_, err = builder.ApplyDiff(meta.NewMeta(txn), &model.SchemaDiff{Type: model.ActionRenameTable, SchemaID: dbID, TableID: tbID, OldSchemaID: dbID})
 	c.Assert(err, IsNil)
-	txn.Rollback()
-	builder.Build()
-	is = handle.Get()
+	err = txn.Rollback()
+	c.Assert(err, IsNil)
+	is = builder.Build()
 	schema, ok = is.SchemaByID(dbID)
 	c.Assert(ok, IsTrue)
 	c.Assert(len(schema.Tables), Equals, 1)
-
-	emptyHandle := handle.EmptyClone()
-	c.Assert(emptyHandle.Get(), IsNil)
 }
 
 func (testSuite) TestMockInfoSchema(c *C) {
@@ -248,44 +255,19 @@ func checkApplyCreateNonExistsTableDoesNotPanic(c *C, txn kv.Transaction, builde
 	c.Assert(infoschema.ErrTableNotExists.Equal(err), IsTrue)
 }
 
-// TestConcurrent makes sure it is safe to concurrently create handle on multiple stores.
-func (testSuite) TestConcurrent(c *C) {
-	defer testleak.AfterTest(c)()
-	storeCount := 5
-	stores := make([]kv.Storage, storeCount)
-	for i := 0; i < storeCount; i++ {
-		store, err := mockstore.NewMockTikvStore()
-		c.Assert(err, IsNil)
-		stores[i] = store
-	}
-	defer func() {
-		for _, store := range stores {
-			store.Close()
-		}
-	}()
-	var wg sync.WaitGroup
-	wg.Add(storeCount)
-	for _, store := range stores {
-		go func(s kv.Storage) {
-			defer wg.Done()
-			_ = infoschema.NewHandle(s)
-		}(store)
-	}
-	wg.Wait()
-}
-
 // TestInfoTables makes sure that all tables of information_schema could be found in infoschema handle.
 func (*testSuite) TestInfoTables(c *C) {
 	defer testleak.AfterTest(c)()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
-	defer store.Close()
-	handle := infoschema.NewHandle(store)
-	builder, err := infoschema.NewBuilder(handle).InitWithDBInfos(nil, 0)
+	defer func() {
+		err := store.Close()
+		c.Assert(err, IsNil)
+	}()
+
+	builder, err := infoschema.NewBuilder(store).InitWithDBInfos(nil, nil, 0)
 	c.Assert(err, IsNil)
-	builder.Build()
-	is := handle.Get()
-	c.Assert(is, NotNil)
+	is := builder.Build()
 
 	infoTables := []string{
 		"SCHEMATA",
@@ -319,6 +301,8 @@ func (*testSuite) TestInfoTables(c *C) {
 		"TABLESPACES",
 		"COLLATION_CHARACTER_SET_APPLICABILITY",
 		"PROCESSLIST",
+		"TIDB_TRX",
+		"DEADLOCKS",
 	}
 	for _, t := range infoTables {
 		tb, err1 := is.TableByName(util.InformationSchemaName, model.NewCIStr(t))
@@ -329,10 +313,333 @@ func (*testSuite) TestInfoTables(c *C) {
 
 func genGlobalID(store kv.Storage) (int64, error) {
 	var globalID int64
-	err := kv.RunInNewTxn(store, true, func(txn kv.Transaction) error {
+	err := kv.RunInNewTxn(context.Background(), store, true, func(ctx context.Context, txn kv.Transaction) error {
 		var err error
 		globalID, err = meta.NewMeta(txn).GenGlobalID()
 		return errors.Trace(err)
 	})
 	return globalID, errors.Trace(err)
+}
+
+func (*testSuite) TestGetBundle(c *C) {
+	defer testleak.AfterTest(c)()
+	store, err := mockstore.NewMockStore()
+	c.Assert(err, IsNil)
+	defer func() {
+		err := store.Close()
+		c.Assert(err, IsNil)
+	}()
+
+	builder, err := infoschema.NewBuilder(store).InitWithDBInfos(nil, nil, 0)
+	c.Assert(err, IsNil)
+	is := builder.Build()
+
+	bundle := &placement.Bundle{
+		ID: placement.PDBundleID,
+		Rules: []*placement.Rule{
+			{
+				GroupID: placement.PDBundleID,
+				ID:      "default",
+				Role:    "voter",
+				Count:   3,
+			},
+		},
+	}
+	is.SetBundle(bundle)
+
+	b := infoschema.GetBundle(is, []int64{})
+	c.Assert(b.Rules, DeepEquals, bundle.Rules)
+
+	// bundle itself is cloned
+	b.ID = "test"
+	c.Assert(bundle.ID, Equals, placement.PDBundleID)
+
+	ptID := placement.GroupID(3)
+	bundle = &placement.Bundle{
+		ID: ptID,
+		Rules: []*placement.Rule{
+			{
+				GroupID: ptID,
+				ID:      "default",
+				Role:    "voter",
+				Count:   4,
+			},
+		},
+	}
+	is.SetBundle(bundle)
+
+	b = infoschema.GetBundle(is, []int64{2, 3})
+	c.Assert(b, DeepEquals, bundle)
+
+	// bundle itself is cloned
+	b.ID = "test"
+	c.Assert(bundle.ID, Equals, ptID)
+
+	ptID = placement.GroupID(1)
+	bundle = &placement.Bundle{
+		ID: ptID,
+		Rules: []*placement.Rule{
+			{
+				GroupID: ptID,
+				ID:      "default",
+				Role:    "voter",
+				Count:   4,
+			},
+		},
+	}
+	is.SetBundle(bundle)
+
+	b = infoschema.GetBundle(is, []int64{1, 2, 3})
+	c.Assert(b, DeepEquals, bundle)
+
+	// bundle itself is cloned
+	b.ID = "test"
+	c.Assert(bundle.ID, Equals, ptID)
+}
+
+func (*testSuite) TestLocalTemporaryTables(c *C) {
+	store, err := mockstore.NewMockStore()
+	c.Assert(err, IsNil)
+
+	createNewSchemaInfo := func(schemaName string) *model.DBInfo {
+		schemaID, err := genGlobalID(store)
+		c.Assert(err, IsNil)
+		return &model.DBInfo{
+			ID:    schemaID,
+			Name:  model.NewCIStr(schemaName),
+			State: model.StatePublic,
+		}
+	}
+
+	createNewTable := func(schemaID int64, tbName string, tempType model.TempTableType) table.Table {
+		colID, err := genGlobalID(store)
+		c.Assert(err, IsNil)
+
+		colInfo := &model.ColumnInfo{
+			ID:        colID,
+			Name:      model.NewCIStr("col1"),
+			Offset:    0,
+			FieldType: *types.NewFieldType(mysql.TypeLonglong),
+			State:     model.StatePublic,
+		}
+
+		tbID, err := genGlobalID(store)
+		c.Assert(err, IsNil)
+
+		tblInfo := &model.TableInfo{
+			ID:      tbID,
+			Name:    model.NewCIStr(tbName),
+			Columns: []*model.ColumnInfo{colInfo},
+			Indices: []*model.IndexInfo{},
+			State:   model.StatePublic,
+		}
+
+		allocs := autoid.NewAllocatorsFromTblInfo(store, schemaID, tblInfo)
+		tbl, err := table.TableFromMeta(allocs, tblInfo)
+		c.Assert(err, IsNil)
+
+		return tbl
+	}
+
+	assertTableByName := func(sc *infoschema.LocalTemporaryTables, schemaName, tableName string, schema *model.DBInfo, tb table.Table) {
+		got, ok := sc.TableByName(model.NewCIStr(schemaName), model.NewCIStr(tableName))
+		if tb == nil {
+			c.Assert(schema, IsNil)
+			c.Assert(ok, IsFalse)
+			c.Assert(got, IsNil)
+		} else {
+			c.Assert(schema, NotNil)
+			c.Assert(ok, IsTrue)
+			c.Assert(got, Equals, tb)
+		}
+	}
+
+	assertTableExists := func(sc *infoschema.LocalTemporaryTables, schemaName, tableName string, exists bool) {
+		got := sc.TableExists(model.NewCIStr(schemaName), model.NewCIStr(tableName))
+		c.Assert(got, Equals, exists)
+	}
+
+	assertTableByID := func(sc *infoschema.LocalTemporaryTables, tbID int64, schema *model.DBInfo, tb table.Table) {
+		got, ok := sc.TableByID(tbID)
+		if tb == nil {
+			c.Assert(schema, IsNil)
+			c.Assert(ok, IsFalse)
+			c.Assert(got, IsNil)
+		} else {
+			c.Assert(schema, NotNil)
+			c.Assert(ok, IsTrue)
+			c.Assert(got, Equals, tb)
+		}
+	}
+
+	assertSchemaByTable := func(sc *infoschema.LocalTemporaryTables, schema model.CIStr, tb *model.TableInfo) {
+		got, ok := sc.SchemaByTable(tb)
+		if tb == nil {
+			c.Assert(schema.L == "", IsTrue)
+			c.Assert(got, Equals, "")
+			c.Assert(ok, IsFalse)
+		} else {
+			c.Assert(ok, Equals, schema.L != "")
+			c.Assert(schema.L, Equals, got)
+		}
+	}
+
+	sc := infoschema.NewLocalTemporaryTables()
+	db1 := createNewSchemaInfo("db1")
+	tb11 := createNewTable(db1.ID, "tb1", model.TempTableLocal)
+	tb12 := createNewTable(db1.ID, "Tb2", model.TempTableLocal)
+	tb13 := createNewTable(db1.ID, "tb3", model.TempTableLocal)
+
+	// db1b has the same name with db1
+	db1b := createNewSchemaInfo("db1")
+	tb15 := createNewTable(db1b.ID, "tb5", model.TempTableLocal)
+	tb16 := createNewTable(db1b.ID, "tb6", model.TempTableLocal)
+	tb17 := createNewTable(db1b.ID, "tb7", model.TempTableLocal)
+
+	db2 := createNewSchemaInfo("db2")
+	tb21 := createNewTable(db2.ID, "tb1", model.TempTableLocal)
+	tb22 := createNewTable(db2.ID, "TB2", model.TempTableLocal)
+	tb24 := createNewTable(db2.ID, "tb4", model.TempTableLocal)
+
+	prepareTables := []struct {
+		db *model.DBInfo
+		tb table.Table
+	}{
+		{db1, tb11}, {db1, tb12}, {db1, tb13},
+		{db1b, tb15}, {db1b, tb16}, {db1b, tb17},
+		{db2, tb21}, {db2, tb22}, {db2, tb24},
+	}
+
+	for _, p := range prepareTables {
+		err = sc.AddTable(p.db, p.tb)
+		c.Assert(err, IsNil)
+	}
+
+	// test exist tables
+	for _, p := range prepareTables {
+		dbName := p.db.Name
+		tbName := p.tb.Meta().Name
+
+		assertTableByName(sc, dbName.O, tbName.O, p.db, p.tb)
+		assertTableByName(sc, dbName.L, tbName.L, p.db, p.tb)
+		assertTableByName(
+			sc,
+			strings.ToUpper(dbName.L[:1])+dbName.L[1:],
+			strings.ToUpper(tbName.L[:1])+tbName.L[1:],
+			p.db, p.tb,
+		)
+
+		assertTableExists(sc, dbName.O, tbName.O, true)
+		assertTableExists(sc, dbName.L, tbName.L, true)
+		assertTableExists(
+			sc,
+			strings.ToUpper(dbName.L[:1])+dbName.L[1:],
+			strings.ToUpper(tbName.L[:1])+tbName.L[1:],
+			true,
+		)
+
+		assertTableByID(sc, p.tb.Meta().ID, p.db, p.tb)
+		assertSchemaByTable(sc, p.db.Name, p.tb.Meta())
+	}
+
+	// test add dup table
+	err = sc.AddTable(db1, tb11)
+	c.Assert(infoschema.ErrTableExists.Equal(err), IsTrue)
+	err = sc.AddTable(db1b, tb15)
+	c.Assert(infoschema.ErrTableExists.Equal(err), IsTrue)
+	err = sc.AddTable(db1b, tb11)
+	c.Assert(infoschema.ErrTableExists.Equal(err), IsTrue)
+	db1c := createNewSchemaInfo("db1")
+	err = sc.AddTable(db1c, createNewTable(db1c.ID, "tb1", model.TempTableLocal))
+	c.Assert(infoschema.ErrTableExists.Equal(err), IsTrue)
+	err = sc.AddTable(db1b, tb11)
+	c.Assert(infoschema.ErrTableExists.Equal(err), IsTrue)
+
+	// failed add has no effect
+	assertTableByName(sc, db1.Name.L, tb11.Meta().Name.L, db1, tb11)
+
+	// delete some tables
+	c.Assert(sc.RemoveTable(model.NewCIStr("db1"), model.NewCIStr("tb1")), IsTrue)
+	c.Assert(sc.RemoveTable(model.NewCIStr("Db2"), model.NewCIStr("tB2")), IsTrue)
+	c.Assert(sc.RemoveTable(model.NewCIStr("db1"), model.NewCIStr("tbx")), IsFalse)
+	c.Assert(sc.RemoveTable(model.NewCIStr("dbx"), model.NewCIStr("tbx")), IsFalse)
+
+	// test non exist tables by name
+	for _, c := range []struct{ dbName, tbName string }{
+		{"db1", "tb1"}, {"db1", "tb4"}, {"db1", "tbx"},
+		{"db2", "tb2"}, {"db2", "tb3"}, {"db2", "tbx"},
+		{"dbx", "tb1"},
+	} {
+		assertTableByName(sc, c.dbName, c.tbName, nil, nil)
+		assertTableExists(sc, c.dbName, c.tbName, false)
+	}
+
+	// test non exist tables by id
+	nonExistID, err := genGlobalID(store)
+	c.Assert(err, IsNil)
+
+	for _, id := range []int64{nonExistID, tb11.Meta().ID, tb22.Meta().ID} {
+		assertTableByID(sc, id, nil, nil)
+	}
+
+	// test non exist table schemaByTable
+	assertSchemaByTable(sc, model.NewCIStr(""), tb11.Meta())
+	assertSchemaByTable(sc, model.NewCIStr(""), tb22.Meta())
+	assertSchemaByTable(sc, model.NewCIStr(""), nil)
+
+	// test TemporaryTableAttachedInfoSchema
+	dbTest := createNewSchemaInfo("test")
+	tmpTbTestA := createNewTable(dbTest.ID, "tba", model.TempTableLocal)
+	normalTbTestA := createNewTable(dbTest.ID, "tba", model.TempTableNone)
+	normalTbTestB := createNewTable(dbTest.ID, "tbb", model.TempTableNone)
+
+	is := &infoschema.TemporaryTableAttachedInfoSchema{
+		InfoSchema:           infoschema.MockInfoSchema([]*model.TableInfo{normalTbTestA.Meta(), normalTbTestB.Meta()}),
+		LocalTemporaryTables: sc,
+	}
+
+	err = sc.AddTable(dbTest, tmpTbTestA)
+	c.Assert(err, IsNil)
+
+	// test TableByName
+	tbl, err := is.TableByName(dbTest.Name, normalTbTestA.Meta().Name)
+	c.Assert(err, IsNil)
+	c.Assert(tbl, Equals, tmpTbTestA)
+	tbl, err = is.TableByName(dbTest.Name, normalTbTestB.Meta().Name)
+	c.Assert(err, IsNil)
+	c.Assert(tbl.Meta(), Equals, normalTbTestB.Meta())
+	tbl, err = is.TableByName(db1.Name, tb11.Meta().Name)
+	c.Assert(infoschema.ErrTableNotExists.Equal(err), IsTrue)
+	c.Assert(tbl, IsNil)
+	tbl, err = is.TableByName(db1.Name, tb12.Meta().Name)
+	c.Assert(err, IsNil)
+	c.Assert(tbl, Equals, tb12)
+
+	// test TableByID
+	tbl, ok := is.TableByID(normalTbTestA.Meta().ID)
+	c.Assert(ok, IsTrue)
+	c.Assert(tbl.Meta(), Equals, normalTbTestA.Meta())
+	tbl, ok = is.TableByID(normalTbTestB.Meta().ID)
+	c.Assert(ok, IsTrue)
+	c.Assert(tbl.Meta(), Equals, normalTbTestB.Meta())
+	tbl, ok = is.TableByID(tmpTbTestA.Meta().ID)
+	c.Assert(ok, IsTrue)
+	c.Assert(tbl, Equals, tmpTbTestA)
+	tbl, ok = is.TableByID(tb12.Meta().ID)
+	c.Assert(ok, IsTrue)
+	c.Assert(tbl, Equals, tb12)
+
+	// test SchemaByTable
+	info, ok := is.SchemaByTable(normalTbTestA.Meta())
+	c.Assert(ok, IsTrue)
+	c.Assert(info.Name.L, Equals, dbTest.Name.L)
+	info, ok = is.SchemaByTable(normalTbTestB.Meta())
+	c.Assert(ok, IsTrue)
+	c.Assert(info.Name.L, Equals, dbTest.Name.L)
+	info, ok = is.SchemaByTable(tmpTbTestA.Meta())
+	c.Assert(ok, IsTrue)
+	c.Assert(info.Name.L, Equals, dbTest.Name.L)
+	info, ok = is.SchemaByTable(tb12.Meta())
+	c.Assert(ok, IsFalse)
+	c.Assert(info, IsNil)
 }

@@ -51,7 +51,7 @@ func (a *aggregationEliminateChecker) tryToEliminateAggregation(agg *LogicalAggr
 			return nil
 		}
 	}
-	schemaByGroupby := expression.NewSchema(agg.groupByCols...)
+	schemaByGroupby := expression.NewSchema(agg.GetGroupByCols()...)
 	coveredByUniqueKey := false
 	for _, key := range agg.children[0].Schema().Keys {
 		if schemaByGroupby.ColumnsIndices(key) != nil {
@@ -67,6 +67,42 @@ func (a *aggregationEliminateChecker) tryToEliminateAggregation(agg *LogicalAggr
 		}
 	}
 	return nil
+}
+
+func (a *aggregationEliminateChecker) tryToEliminateDistinct(agg *LogicalAggregation) {
+	for _, af := range agg.AggFuncs {
+		if af.HasDistinct {
+			cols := make([]*expression.Column, 0, len(af.Args))
+			canEliminate := true
+			for _, arg := range af.Args {
+				if col, ok := arg.(*expression.Column); ok {
+					cols = append(cols, col)
+				} else {
+					canEliminate = false
+					break
+				}
+			}
+			if canEliminate {
+				distinctByUniqueKey := false
+				schemaByDistinct := expression.NewSchema(cols...)
+				for _, key := range agg.children[0].Schema().Keys {
+					if schemaByDistinct.ColumnsIndices(key) != nil {
+						distinctByUniqueKey = true
+						break
+					}
+				}
+				for _, key := range agg.children[0].Schema().UniqueKeys {
+					if schemaByDistinct.ColumnsIndices(key) != nil {
+						distinctByUniqueKey = true
+						break
+					}
+				}
+				if distinctByUniqueKey {
+					af.HasDistinct = false
+				}
+			}
+		}
+	}
 }
 
 // ConvertAggToProj convert aggregation to projection.
@@ -104,12 +140,12 @@ func rewriteExpr(ctx sessionctx.Context, aggFunc *aggregation.AggFuncDesc) (bool
 
 func rewriteCount(ctx sessionctx.Context, exprs []expression.Expression, targetTp *types.FieldType) expression.Expression {
 	// If is count(expr), we will change it to if(isnull(expr), 0, 1).
-	// If is count(distinct x, y, z) we will change it to if(isnull(x) or isnull(y) or isnull(z), 0, 1).
+	// If is count(distinct x, y, z), we will change it to if(isnull(x) or isnull(y) or isnull(z), 0, 1).
 	// If is count(expr not null), we will change it to constant 1.
 	isNullExprs := make([]expression.Expression, 0, len(exprs))
 	for _, expr := range exprs {
 		if mysql.HasNotNullFlag(expr.GetType().Flag) {
-			isNullExprs = append(isNullExprs, expression.Zero)
+			isNullExprs = append(isNullExprs, expression.NewZero())
 		} else {
 			isNullExpr := expression.NewFunctionInternal(ctx, ast.IsNull, types.NewFieldType(mysql.TypeTiny), expr)
 			isNullExprs = append(isNullExprs, isNullExpr)
@@ -117,7 +153,7 @@ func rewriteCount(ctx sessionctx.Context, exprs []expression.Expression, targetT
 	}
 
 	innerExpr := expression.ComposeDNFCondition(ctx, isNullExprs...)
-	newExpr := expression.NewFunctionInternal(ctx, ast.If, targetTp, innerExpr, expression.Zero, expression.One)
+	newExpr := expression.NewFunctionInternal(ctx, ast.If, targetTp, innerExpr, expression.NewZero(), expression.NewOne())
 	return newExpr
 }
 
@@ -127,7 +163,7 @@ func rewriteBitFunc(ctx sessionctx.Context, funcType string, arg expression.Expr
 	outerCast := wrapCastFunction(ctx, innerCast, targetTp)
 	var finalExpr expression.Expression
 	if funcType != ast.AggFuncBitAnd {
-		finalExpr = expression.NewFunctionInternal(ctx, ast.Ifnull, targetTp, outerCast, expression.Zero.Clone())
+		finalExpr = expression.NewFunctionInternal(ctx, ast.Ifnull, targetTp, outerCast, expression.NewZero())
 	} else {
 		finalExpr = expression.NewFunctionInternal(ctx, ast.Ifnull, outerCast.GetType(), outerCast, &expression.Constant{Value: types.NewUintDatum(math.MaxUint64), RetType: targetTp})
 	}
@@ -136,7 +172,7 @@ func rewriteBitFunc(ctx sessionctx.Context, funcType string, arg expression.Expr
 
 // wrapCastFunction will wrap a cast if the targetTp is not equal to the arg's.
 func wrapCastFunction(ctx sessionctx.Context, arg expression.Expression, targetTp *types.FieldType) expression.Expression {
-	if arg.GetType() == targetTp {
+	if arg.GetType().Equal(targetTp) {
 		return arg
 	}
 	return expression.BuildCastFunction(ctx, arg, targetTp)
@@ -156,6 +192,7 @@ func (a *aggregationEliminator) optimize(ctx context.Context, p LogicalPlan) (Lo
 	if !ok {
 		return p, nil
 	}
+	a.tryToEliminateDistinct(agg)
 	if proj := a.tryToEliminateAggregation(agg); proj != nil {
 		return proj, nil
 	}

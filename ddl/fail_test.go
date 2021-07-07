@@ -24,12 +24,16 @@ import (
 )
 
 func (s *testColumnChangeSuite) TestFailBeforeDecodeArgs(c *C) {
-	d := newDDL(
+	d := testNewDDLAndStart(
 		context.Background(),
+		c,
 		WithStore(s.store),
 		WithLease(testLease),
 	)
-	defer d.Stop()
+	defer func() {
+		err := d.Stop()
+		c.Assert(err, IsNil)
+	}()
 	// create table t_fail (c1 int, c2 int);
 	tblInfo := testTableInfo(c, d, "t_fail", 2)
 	ctx := testNewContext(d)

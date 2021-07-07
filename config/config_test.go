@@ -16,7 +16,9 @@ package config
 import (
 	"encoding/json"
 	"os"
+	"os/user"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -37,7 +39,7 @@ func TestT(t *testing.T) {
 	TestingT(t)
 }
 
-func (s *testConfigSuite) TestNullableBoolUnmashal(c *C) {
+func (s *testConfigSuite) TestNullableBoolUnmarshal(c *C) {
 	var nb = nullableBool{false, false}
 	data, err := json.Marshal(nb)
 	c.Assert(err, IsNil)
@@ -107,8 +109,10 @@ func (s *testConfigSuite) TestLogConfig(c *C) {
 		c.Assert(conf.Log.EnableTimestamp, Equals, expectedEnableTimestamp)
 		c.Assert(conf.Log.DisableTimestamp, Equals, expectedDisableTimestamp)
 		c.Assert(conf.Log.ToLogConfig(), DeepEquals, logutil.NewLogConfig("info", "text", "tidb-slow.log", conf.Log.File, resultedDisableTimestamp, func(config *zaplog.Config) { config.DisableErrorVerbose = resultedDisableErrorVerbose }))
-		f.Truncate(0)
-		f.Seek(0, 0)
+		err := f.Truncate(0)
+		c.Assert(err, IsNil)
+		_, err = f.Seek(0, 0)
+		c.Assert(err, IsNil)
 	}
 
 	testLoad(`
@@ -148,7 +152,7 @@ disable-error-stack = false
 
 func (s *testConfigSuite) TestConfig(c *C) {
 	conf := new(Config)
-	conf.TempStoragePath = filepath.Join(os.TempDir(), "tidb", "tmp-storage")
+	conf.TempStoragePath = tempStorageDirName
 	conf.Binlog.Enable = true
 	conf.Binlog.IgnoreError = true
 	conf.Binlog.Strategy = "hash"
@@ -170,10 +174,13 @@ unrecognized-option-test = true
 	c.Assert(err, IsNil)
 	c.Assert(f.Sync(), IsNil)
 
-	c.Assert(conf.Load(configFile), ErrorMatches, "(?:.|\n)*unknown configuration option(?:.|\n)*")
+	c.Assert(conf.Load(configFile), ErrorMatches, "(?:.|\n)*invalid configuration option(?:.|\n)*")
+	c.Assert(conf.MaxServerConnections, Equals, uint32(0))
 
-	f.Truncate(0)
-	f.Seek(0, 0)
+	err = f.Truncate(0)
+	c.Assert(err, IsNil)
+	_, err = f.Seek(0, 0)
+	c.Assert(err, IsNil)
 
 	_, err = f.WriteString(`
 token-limit = 0
@@ -187,23 +194,44 @@ repair-mode = true
 max-server-connections = 200
 mem-quota-query = 10000
 max-index-length = 3080
+index-limit = 70
+table-column-count-limit = 4000
+skip-register-to-dashboard = true
+deprecate-integer-display-length = true
+enable-enum-length-limit = false
+stores-refresh-interval = 30
+enable-forwarding = true
 [performance]
 txn-total-size-limit=2000
+tcp-no-delay = false
 [tikv-client]
 commit-timeout="41s"
 max-batch-size=128
 region-cache-ttl=6000
 store-limit=0
+ttl-refreshed-txn-size=8192
+[tikv-client.async-commit]
+keys-limit=123
+total-key-size-limit=1024
 [stmt-summary]
 enable=false
+enable-internal-query=true
 max-stmt-count=1000
 max-sql-length=1024
 refresh-interval=100
 history-size=100
 [experimental]
-allow-auto-random = true
+allow-expression-index = true
 [isolation-read]
 engines = ["tiflash"]
+[labels]
+foo= "bar"
+group= "abc"
+zone= "dc-1"
+[security]
+spilled-file-encryption-method = "plaintext"
+[pessimistic-txn]
+deadlock-history-capacity = 123
 `)
 
 	c.Assert(err, IsNil)
@@ -220,16 +248,21 @@ engines = ["tiflash"]
 	// Test that the value will be overwritten by the config file.
 	c.Assert(conf.Performance.TxnTotalSizeLimit, Equals, uint64(2000))
 	c.Assert(conf.AlterPrimaryKey, Equals, true)
+	c.Assert(conf.Performance.TCPNoDelay, Equals, false)
 
 	c.Assert(conf.TiKVClient.CommitTimeout, Equals, "41s")
+	c.Assert(conf.TiKVClient.AsyncCommit.KeysLimit, Equals, uint(123))
+	c.Assert(conf.TiKVClient.AsyncCommit.TotalKeySizeLimit, Equals, uint64(1024))
 	c.Assert(conf.TiKVClient.MaxBatchSize, Equals, uint(128))
 	c.Assert(conf.TiKVClient.RegionCacheTTL, Equals, uint(6000))
 	c.Assert(conf.TiKVClient.StoreLimit, Equals, int64(0))
+	c.Assert(conf.TiKVClient.TTLRefreshedTxnSize, Equals, int64(8192))
 	c.Assert(conf.TokenLimit, Equals, uint(1000))
 	c.Assert(conf.EnableTableLock, IsTrue)
 	c.Assert(conf.DelayCleanTableLock, Equals, uint64(5))
 	c.Assert(conf.SplitRegionMaxNum, Equals, uint64(10000))
 	c.Assert(conf.StmtSummary.Enable, Equals, false)
+	c.Assert(conf.StmtSummary.EnableInternalQuery, Equals, true)
 	c.Assert(conf.StmtSummary.MaxStmtCount, Equals, uint(1000))
 	c.Assert(conf.StmtSummary.MaxSQLLength, Equals, uint(1024))
 	c.Assert(conf.StmtSummary.RefreshInterval, Equals, 100)
@@ -238,9 +271,22 @@ engines = ["tiflash"]
 	c.Assert(conf.RepairMode, Equals, true)
 	c.Assert(conf.MaxServerConnections, Equals, uint32(200))
 	c.Assert(conf.MemQuotaQuery, Equals, int64(10000))
-	c.Assert(conf.Experimental.AllowAutoRandom, IsTrue)
+	c.Assert(conf.Experimental.AllowsExpressionIndex, IsTrue)
 	c.Assert(conf.IsolationRead.Engines, DeepEquals, []string{"tiflash"})
 	c.Assert(conf.MaxIndexLength, Equals, 3080)
+	c.Assert(conf.IndexLimit, Equals, 70)
+	c.Assert(conf.TableColumnCountLimit, Equals, uint32(4000))
+	c.Assert(conf.SkipRegisterToDashboard, Equals, true)
+	c.Assert(len(conf.Labels), Equals, 3)
+	c.Assert(conf.Labels["foo"], Equals, "bar")
+	c.Assert(conf.Labels["group"], Equals, "abc")
+	c.Assert(conf.Labels["zone"], Equals, "dc-1")
+	c.Assert(conf.Security.SpilledFileEncryptionMethod, Equals, SpilledFileEncryptionMethodPlaintext)
+	c.Assert(conf.DeprecateIntegerDisplayWidth, Equals, true)
+	c.Assert(conf.EnableEnumLengthLimit, Equals, false)
+	c.Assert(conf.EnableForwarding, Equals, true)
+	c.Assert(conf.StoresRefreshInterval, Equals, uint64(30))
+	c.Assert(conf.PessimisticTxn.DeadlockHistoryCapacity, Equals, uint(123))
 
 	_, err = f.WriteString(`
 [log.file]
@@ -249,6 +295,41 @@ log-rotate = true`)
 	err = conf.Load(configFile)
 	tmp := err.(*ErrConfigValidationFailed)
 	c.Assert(isAllDeprecatedConfigItems(tmp.UndecodedItems), IsTrue)
+
+	// Test telemetry config default value and whether it will be overwritten.
+	conf = NewConfig()
+	err = f.Truncate(0)
+	c.Assert(err, IsNil)
+	_, err = f.Seek(0, 0)
+	c.Assert(err, IsNil)
+	c.Assert(f.Sync(), IsNil)
+	c.Assert(conf.Load(configFile), IsNil)
+	c.Assert(conf.EnableTelemetry, Equals, true)
+
+	_, err = f.WriteString(`
+enable-table-lock = true
+`)
+	c.Assert(err, IsNil)
+	c.Assert(f.Sync(), IsNil)
+	c.Assert(conf.Load(configFile), IsNil)
+	c.Assert(conf.EnableTelemetry, Equals, true)
+
+	_, err = f.WriteString(`
+enable-telemetry = false
+`)
+	c.Assert(err, IsNil)
+	c.Assert(f.Sync(), IsNil)
+	c.Assert(conf.Load(configFile), IsNil)
+	c.Assert(conf.EnableTelemetry, Equals, false)
+
+	_, err = f.WriteString(`
+[security]
+spilled-file-encryption-method = "aes128-ctr"
+`)
+	c.Assert(err, IsNil)
+	c.Assert(f.Sync(), IsNil)
+	c.Assert(conf.Load(configFile), IsNil)
+	c.Assert(conf.Security.SpilledFileEncryptionMethod, Equals, SpilledFileEncryptionMethodAES128CTR)
 
 	c.Assert(f.Close(), IsNil)
 	c.Assert(os.Remove(configFile), IsNil)
@@ -335,7 +416,8 @@ xkNuJ2BlEGkwWLiRbKy1lNBBFUXKuhh3L/EIY10WTnr3TQzeL6H1
 	conf.Security.ClusterSSLCA = certFile
 	conf.Security.ClusterSSLCert = certFile
 	conf.Security.ClusterSSLKey = keyFile
-	tlsConfig, err := conf.Security.ToTLSConfig()
+	clusterSecurity := conf.Security.ClusterSecurity()
+	tlsConfig, err := clusterSecurity.ToTLSConfig()
 	c.Assert(err, IsNil)
 	c.Assert(tlsConfig, NotNil)
 
@@ -345,6 +427,14 @@ xkNuJ2BlEGkwWLiRbKy1lNBBFUXKuhh3L/EIY10WTnr3TQzeL6H1
 	// is recycled when the reference count drops to 0.
 	c.Assert(os.Remove(certFile), IsNil)
 	c.Assert(os.Remove(keyFile), IsNil)
+
+	// test for config `toml` and `json` tag names
+	c1 := Config{}
+	st := reflect.TypeOf(c1)
+	for i := 0; i < st.NumField(); i++ {
+		field := st.Field(i)
+		c.Assert(field.Tag.Get("toml"), Equals, field.Tag.Get("json"))
+	}
 }
 
 func (s *testConfigSuite) TestOOMActionValid(c *C) {
@@ -380,23 +470,21 @@ func (s *testConfigSuite) TestTxnTotalSizeLimitValid(c *C) {
 		conf.Performance.TxnTotalSizeLimit = tt.limit
 		c.Assert(conf.Valid() == nil, Equals, tt.valid)
 	}
-
-	conf.Binlog.Enable = true
-	conf.Performance.TxnTotalSizeLimit = 100<<20 + 1
-	c.Assert(conf.Valid(), NotNil)
 }
 
-func (s *testConfigSuite) TestAllowAutoRandomValid(c *C) {
+func (s *testConfigSuite) TestPreparePlanCacheValid(c *C) {
 	conf := NewConfig()
-	checkValid := func(allowAlterPK, allowAutoRand, shouldBeValid bool) {
-		conf.AlterPrimaryKey = allowAlterPK
-		conf.Experimental.AllowAutoRandom = allowAutoRand
-		c.Assert(conf.Valid() == nil, Equals, shouldBeValid)
+	tests := map[PreparedPlanCache]bool{
+		{Enabled: true, Capacity: 0}:                        false,
+		{Enabled: true, Capacity: 2}:                        true,
+		{Enabled: true, MemoryGuardRatio: -0.1}:             false,
+		{Enabled: true, MemoryGuardRatio: 2.2}:              false,
+		{Enabled: true, Capacity: 2, MemoryGuardRatio: 0.5}: true,
 	}
-	checkValid(true, true, false)
-	checkValid(true, false, true)
-	checkValid(false, true, true)
-	checkValid(false, false, true)
+	for testCase, res := range tests {
+		conf.PreparedPlanCache = testCase
+		c.Assert(conf.Valid() == nil, Equals, res)
+	}
 }
 
 func (s *testConfigSuite) TestMaxIndexLength(c *C) {
@@ -411,15 +499,126 @@ func (s *testConfigSuite) TestMaxIndexLength(c *C) {
 	checkValid(DefMaxOfMaxIndexLength+1, false)
 }
 
-func (s *testConfigSuite) TestParsePath(c *C) {
-	etcdAddrs, disableGC, err := ParsePath("tikv://node1:2379,node2:2379")
-	c.Assert(err, IsNil)
-	c.Assert(etcdAddrs, DeepEquals, []string{"node1:2379", "node2:2379"})
-	c.Assert(disableGC, IsFalse)
+func (s *testConfigSuite) TestIndexLimit(c *C) {
+	conf := NewConfig()
+	checkValid := func(indexLimit int, shouldBeValid bool) {
+		conf.IndexLimit = indexLimit
+		c.Assert(conf.Valid() == nil, Equals, shouldBeValid)
+	}
+	checkValid(DefIndexLimit, true)
+	checkValid(DefIndexLimit-1, false)
+	checkValid(DefMaxOfIndexLimit, true)
+	checkValid(DefMaxOfIndexLimit+1, false)
+}
 
-	_, _, err = ParsePath("tikv://node1:2379")
+func (s *testConfigSuite) TestTableColumnCountLimit(c *C) {
+	conf := NewConfig()
+	checkValid := func(tableColumnLimit int, shouldBeValid bool) {
+		conf.TableColumnCountLimit = uint32(tableColumnLimit)
+		c.Assert(conf.Valid() == nil, Equals, shouldBeValid)
+	}
+	checkValid(DefTableColumnCountLimit, true)
+	checkValid(DefTableColumnCountLimit-1, false)
+	checkValid(DefMaxOfTableColumnCountLimit, true)
+	checkValid(DefMaxOfTableColumnCountLimit+1, false)
+}
+
+func (s *testConfigSuite) TestEncodeDefTempStorageDir(c *C) {
+	tests := []struct {
+		host       string
+		statusHost string
+		port       uint
+		statusPort uint
+		expect     string
+	}{
+		{"0.0.0.0", "0.0.0.0", 4000, 10080, "MC4wLjAuMDo0MDAwLzAuMC4wLjA6MTAwODA="},
+		{"127.0.0.1", "127.16.5.1", 4000, 10080, "MTI3LjAuMC4xOjQwMDAvMTI3LjE2LjUuMToxMDA4MA=="},
+		{"127.0.0.1", "127.16.5.1", 4000, 15532, "MTI3LjAuMC4xOjQwMDAvMTI3LjE2LjUuMToxNTUzMg=="},
+	}
+
+	var osUID string
+	currentUser, err := user.Current()
+	if err != nil {
+		osUID = ""
+	} else {
+		osUID = currentUser.Uid
+	}
+
+	dirPrefix := filepath.Join(os.TempDir(), osUID+"_tidb")
+	for _, test := range tests {
+		tempStorageDir := encodeDefTempStorageDir(os.TempDir(), test.host, test.statusHost, test.port, test.statusPort)
+		c.Assert(tempStorageDir, Equals, filepath.Join(dirPrefix, test.expect, "tmp-storage"))
+	}
+}
+
+func (s *testConfigSuite) TestModifyThroughLDFlags(c *C) {
+	tests := []struct {
+		Edition               string
+		CheckBeforeDropLDFlag string
+		EnableTelemetry       bool
+		CheckTableBeforeDrop  bool
+	}{
+		{"Community", "None", true, false},
+		{"Community", "1", true, true},
+		{"Enterprise", "None", false, false},
+		{"Enterprise", "1", false, true},
+	}
+
+	originalEnableTelemetry := defaultConf.EnableTelemetry
+	originalCheckTableBeforeDrop := CheckTableBeforeDrop
+	originalGlobalConfig := GetGlobalConfig()
+
+	for _, test := range tests {
+		defaultConf.EnableTelemetry = true
+		CheckTableBeforeDrop = false
+
+		initByLDFlags(test.Edition, test.CheckBeforeDropLDFlag)
+
+		conf := GetGlobalConfig()
+		c.Assert(conf.EnableTelemetry, Equals, test.EnableTelemetry)
+		c.Assert(defaultConf.EnableTelemetry, Equals, test.EnableTelemetry)
+		c.Assert(CheckTableBeforeDrop, Equals, test.CheckTableBeforeDrop)
+	}
+
+	defaultConf.EnableTelemetry = originalEnableTelemetry
+	CheckTableBeforeDrop = originalCheckTableBeforeDrop
+	StoreGlobalConfig(originalGlobalConfig)
+}
+
+func (s *testConfigSuite) TestSecurityValid(c *C) {
+	c1 := NewConfig()
+	tests := []struct {
+		spilledFileEncryptionMethod string
+		valid                       bool
+	}{
+		{"", false},
+		{"Plaintext", true},
+		{"plaintext123", false},
+		{"aes256-ctr", false},
+		{"aes128-ctr", true},
+	}
+	for _, tt := range tests {
+		c1.Security.SpilledFileEncryptionMethod = tt.spilledFileEncryptionMethod
+		c.Assert(c1.Valid() == nil, Equals, tt.valid)
+	}
+}
+
+func (s *testConfigSuite) TestTcpNoDelay(c *C) {
+	c1 := NewConfig()
+	//check default value
+	c.Assert(c1.Performance.TCPNoDelay, Equals, true)
+}
+
+func (s *testConfigSuite) TestConfigExample(c *C) {
+	conf := NewConfig()
+	_, localFile, _, _ := runtime.Caller(0)
+	configFile := filepath.Join(filepath.Dir(localFile), "config.toml.example")
+	metaData, err := toml.DecodeFile(configFile, conf)
 	c.Assert(err, IsNil)
-	_, disableGC, err = ParsePath("tikv://node1:2379?disableGC=true")
-	c.Assert(err, IsNil)
-	c.Assert(disableGC, IsTrue)
+	keys := metaData.Keys()
+	for _, key := range keys {
+		for _, s := range key {
+			c.Assert(ContainHiddenConfig(s), IsFalse)
+		}
+	}
 }

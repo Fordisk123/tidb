@@ -14,10 +14,19 @@
 package aggfuncs
 
 import (
+	"unsafe"
+
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/set"
+)
+
+const (
+	// DefPartialResult4VarPopFloat64Size is the size of partialResult4VarPopFloat64
+	DefPartialResult4VarPopFloat64Size = int64(unsafe.Sizeof(partialResult4VarPopFloat64{}))
+	// DefPartialResult4VarPopDistinctFloat64Size is the size of partialResult4VarPopDistinctFloat64
+	DefPartialResult4VarPopDistinctFloat64Size = int64(unsafe.Sizeof(partialResult4VarPopDistinctFloat64{}))
 )
 
 type baseVarPopAggFunc struct {
@@ -34,8 +43,8 @@ type partialResult4VarPopFloat64 struct {
 	variance float64
 }
 
-func (e *varPop4Float64) AllocPartialResult() PartialResult {
-	return PartialResult(&partialResult4VarPopFloat64{})
+func (e *varPop4Float64) AllocPartialResult() (pr PartialResult, memDelta int64) {
+	return PartialResult(&partialResult4VarPopFloat64{}), DefPartialResult4VarPopFloat64Size
 }
 
 func (e *varPop4Float64) ResetPartialResult(pr PartialResult) {
@@ -51,8 +60,8 @@ func (e *varPop4Float64) AppendFinalResult2Chunk(sctx sessionctx.Context, pr Par
 		chk.AppendNull(e.ordinal)
 		return nil
 	}
-	varicance := p.variance / float64(p.count)
-	chk.AppendFloat64(e.ordinal, varicance)
+	variance := p.variance / float64(p.count)
+	chk.AppendFloat64(e.ordinal, variance)
 	return nil
 }
 
@@ -62,12 +71,12 @@ func calculateIntermediate(count int64, sum float64, input float64, variance flo
 	return variance
 }
 
-func (e *varPop4Float64) UpdatePartialResult(sctx sessionctx.Context, rowsInGroup []chunk.Row, pr PartialResult) error {
+func (e *varPop4Float64) UpdatePartialResult(sctx sessionctx.Context, rowsInGroup []chunk.Row, pr PartialResult) (memDelta int64, err error) {
 	p := (*partialResult4VarPopFloat64)(pr)
 	for _, row := range rowsInGroup {
 		input, isNull, err := e.args[0].EvalReal(sctx, row)
 		if err != nil {
-			return errors.Trace(err)
+			return 0, errors.Trace(err)
 		}
 		if isNull {
 			continue
@@ -78,7 +87,7 @@ func (e *varPop4Float64) UpdatePartialResult(sctx sessionctx.Context, rowsInGrou
 			p.variance = calculateIntermediate(p.count, p.sum, input, p.variance)
 		}
 	}
-	return nil
+	return 0, nil
 }
 
 func calculateMerge(srcCount, dstCount int64, srcSum, dstSum, srcVariance, dstVariance float64) float64 {
@@ -90,23 +99,23 @@ func calculateMerge(srcCount, dstCount int64, srcSum, dstSum, srcVariance, dstVa
 	return dstVariance
 }
 
-func (e *varPop4Float64) MergePartialResult(sctx sessionctx.Context, src PartialResult, dst PartialResult) error {
+func (e *varPop4Float64) MergePartialResult(sctx sessionctx.Context, src, dst PartialResult) (memDelta int64, err error) {
 	p1, p2 := (*partialResult4VarPopFloat64)(src), (*partialResult4VarPopFloat64)(dst)
 	if p1.count == 0 {
-		return nil
+		return 0, nil
 	}
 	if p2.count == 0 {
 		p2.count = p1.count
 		p2.sum = p1.sum
 		p2.variance = p1.variance
-		return nil
+		return 0, nil
 	}
 	if p2.count != 0 && p1.count != 0 {
 		p2.variance = calculateMerge(p1.count, p2.count, p1.sum, p2.sum, p1.variance, p2.variance)
 		p2.count += p1.count
 		p2.sum += p1.sum
 	}
-	return nil
+	return 0, nil
 }
 
 type varPop4DistinctFloat64 struct {
@@ -117,16 +126,17 @@ type partialResult4VarPopDistinctFloat64 struct {
 	count    int64
 	sum      float64
 	variance float64
-	valSet   set.Float64Set
+	valSet   set.Float64SetWithMemoryUsage
 }
 
-func (e *varPop4DistinctFloat64) AllocPartialResult() PartialResult {
+func (e *varPop4DistinctFloat64) AllocPartialResult() (pr PartialResult, memDelta int64) {
 	p := new(partialResult4VarPopDistinctFloat64)
 	p.count = 0
 	p.sum = 0
 	p.variance = 0
-	p.valSet = set.NewFloat64Set()
-	return PartialResult(p)
+	setSize := int64(0)
+	p.valSet, setSize = set.NewFloat64SetWithMemoryUsage()
+	return PartialResult(p), DefPartialResult4VarPopDistinctFloat64Size + setSize
 }
 
 func (e *varPop4DistinctFloat64) ResetPartialResult(pr PartialResult) {
@@ -134,7 +144,7 @@ func (e *varPop4DistinctFloat64) ResetPartialResult(pr PartialResult) {
 	p.count = 0
 	p.sum = 0
 	p.variance = 0
-	p.valSet = set.NewFloat64Set()
+	p.valSet, _ = set.NewFloat64SetWithMemoryUsage()
 }
 
 func (e *varPop4DistinctFloat64) AppendFinalResult2Chunk(sctx sessionctx.Context, pr PartialResult, chk *chunk.Chunk) error {
@@ -143,27 +153,28 @@ func (e *varPop4DistinctFloat64) AppendFinalResult2Chunk(sctx sessionctx.Context
 		chk.AppendNull(e.ordinal)
 		return nil
 	}
-	varicance := p.variance / float64(p.count)
-	chk.AppendFloat64(e.ordinal, varicance)
+	variance := p.variance / float64(p.count)
+	chk.AppendFloat64(e.ordinal, variance)
 	return nil
 }
 
-func (e *varPop4DistinctFloat64) UpdatePartialResult(sctx sessionctx.Context, rowsInGroup []chunk.Row, pr PartialResult) error {
+func (e *varPop4DistinctFloat64) UpdatePartialResult(sctx sessionctx.Context, rowsInGroup []chunk.Row, pr PartialResult) (memDelta int64, err error) {
 	p := (*partialResult4VarPopDistinctFloat64)(pr)
 	for _, row := range rowsInGroup {
 		input, isNull, err := e.args[0].EvalReal(sctx, row)
 		if err != nil {
-			return errors.Trace(err)
+			return memDelta, errors.Trace(err)
 		}
 		if isNull || p.valSet.Exist(input) {
 			continue
 		}
-		p.valSet.Insert(input)
+		memDelta += p.valSet.Insert(input)
 		p.count++
 		p.sum += input
+
 		if p.count > 1 {
 			p.variance = calculateIntermediate(p.count, p.sum, input, p.variance)
 		}
 	}
-	return nil
+	return memDelta, nil
 }

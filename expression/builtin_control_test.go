@@ -116,7 +116,7 @@ func (s *testEvaluatorSuite) TestIfNull(c *C) {
 		{tm, nil, tm, false, false},
 		{nil, duration, duration, false, false},
 		{nil, types.NewDecFromFloatForTest(123.123), types.NewDecFromFloatForTest(123.123), false, false},
-		{nil, types.NewBinaryLiteralFromUint(0x01, -1), uint64(1), false, false},
+		{nil, types.NewBinaryLiteralFromUint(0x01, -1), "\x01", false, false},
 		{nil, types.Set{Value: 1, Name: "abc"}, "abc", false, false},
 		{nil, jsonInt.GetMysqlJSON(), jsonInt.GetMysqlJSON(), false, false},
 		{"abc", nil, "abc", false, false},
@@ -139,9 +139,9 @@ func (s *testEvaluatorSuite) TestIfNull(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Ifnull].getFunction(s.ctx, []Expression{Zero, Zero})
+	_, err := funcs[ast.Ifnull].getFunction(s.ctx, []Expression{NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 
-	_, err = funcs[ast.Ifnull].getFunction(s.ctx, []Expression{Zero})
+	_, err = funcs[ast.Ifnull].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, NotNil)
 }

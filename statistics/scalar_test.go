@@ -25,7 +25,10 @@ const eps = 1e-9
 
 func getDecimal(value float64) *types.MyDecimal {
 	dec := &types.MyDecimal{}
-	dec.FromFloat64(value)
+	err := dec.FromFloat64(value)
+	if err != nil {
+		panic(err)
+	}
 	return dec
 }
 
@@ -35,12 +38,12 @@ func getDuration(value string) types.Duration {
 }
 
 func getTime(year, month, day int, timeType byte) types.Time {
-	ret := types.NewTime(types.FromDate(year, int(month), day, 0, 0, 0, 0), timeType, types.DefaultFsp)
+	ret := types.NewTime(types.FromDate(year, month, day, 0, 0, 0, 0), timeType, types.DefaultFsp)
 	return ret
 }
 
 func getTimeStamp(hour, min, sec int, timeType byte) types.Time {
-	ret := types.NewTime(types.FromDate(2017, int(1), 1, hour, min, sec, 0), timeType, 0)
+	ret := types.NewTime(types.FromDate(2017, 1, 1, hour, min, sec, 0), timeType, 0)
 	return ret
 }
 
@@ -241,6 +244,13 @@ func (s *testStatisticsSuite) TestEnumRangeValues(c *C) {
 			high:        types.NewIntDatum(0),
 			lowExclude:  false,
 			highExclude: false,
+			res:         "",
+		},
+		{
+			low:         types.NewTimeDatum(getTime(2017, 1, 1, mysql.TypeDate)),
+			high:        types.NewTimeDatum(getTime(2017, 1, 1, mysql.TypeDate)),
+			lowExclude:  true,
+			highExclude: true,
 			res:         "",
 		},
 	}

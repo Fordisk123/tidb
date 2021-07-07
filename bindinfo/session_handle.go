@@ -14,6 +14,7 @@
 package bindinfo
 
 import (
+	"strings"
 	"time"
 
 	"github.com/pingcap/parser"
@@ -39,44 +40,33 @@ func NewSessionBindHandle(parser *parser.Parser) *SessionHandle {
 // appendBindRecord adds the BindRecord to the cache, all the stale bindMetas are
 // removed from the cache after this operation.
 func (h *SessionHandle) appendBindRecord(hash string, meta *BindRecord) {
-	// Make sure there is only one goroutine writes the cache.
 	oldRecord := h.ch.getBindRecord(hash, meta.OriginalSQL, meta.Db)
-	newRecord := merge(oldRecord, meta)
-	h.ch.setBindRecord(hash, newRecord)
-	updateMetrics(metrics.ScopeSession, oldRecord, newRecord, false)
+	h.ch.setBindRecord(hash, meta)
+	updateMetrics(metrics.ScopeSession, oldRecord, meta, false)
 }
 
-// AddBindRecord new a BindRecord with BindMeta, add it to the cache.
-func (h *SessionHandle) AddBindRecord(sctx sessionctx.Context, record *BindRecord) error {
-	err := record.prepareHints(sctx)
+// CreateBindRecord creates a BindRecord to the cache.
+// It replaces all the exists bindings for the same normalized SQL.
+func (h *SessionHandle) CreateBindRecord(sctx sessionctx.Context, record *BindRecord) (err error) {
+	err = record.prepareHints(sctx)
 	if err != nil {
 		return err
 	}
-	br := h.GetBindRecord(record.OriginalSQL, record.Db)
-	var duplicateBinding *Binding
-	if br != nil {
-		binding := br.FindBinding(record.Bindings[0].id)
-		if binding != nil {
-			duplicateBinding = binding
-		}
-	}
+	record.Db = strings.ToLower(record.Db)
 	now := types.NewTime(types.FromGoTime(time.Now().In(sctx.GetSessionVars().StmtCtx.TimeZone)), mysql.TypeTimestamp, 3)
 	for i := range record.Bindings {
-		if duplicateBinding != nil {
-			record.Bindings[i].CreateTime = duplicateBinding.CreateTime
-		} else {
-			record.Bindings[i].CreateTime = now
-		}
+		record.Bindings[i].CreateTime = now
 		record.Bindings[i].UpdateTime = now
 	}
 
 	// update the BindMeta to the cache.
-	h.appendBindRecord(parser.DigestNormalized(record.OriginalSQL), record)
+	h.appendBindRecord(parser.DigestNormalized(record.OriginalSQL).String(), record)
 	return nil
 }
 
 // DropBindRecord drops a BindRecord in the cache.
 func (h *SessionHandle) DropBindRecord(originalSQL, db string, binding *Binding) error {
+	db = strings.ToLower(db)
 	oldRecord := h.GetBindRecord(originalSQL, db)
 	var newRecord *BindRecord
 	record := &BindRecord{OriginalSQL: originalSQL, Db: db}
@@ -88,17 +78,17 @@ func (h *SessionHandle) DropBindRecord(originalSQL, db string, binding *Binding)
 	} else {
 		newRecord = record
 	}
-	h.ch.setBindRecord(parser.DigestNormalized(record.OriginalSQL), newRecord)
+	h.ch.setBindRecord(parser.DigestNormalized(record.OriginalSQL).String(), newRecord)
 	updateMetrics(metrics.ScopeSession, oldRecord, newRecord, false)
 	return nil
 }
 
 // GetBindRecord return the BindMeta of the (normdOrigSQL,db) if BindMeta exist.
 func (h *SessionHandle) GetBindRecord(normdOrigSQL, db string) *BindRecord {
-	hash := parser.DigestNormalized(normdOrigSQL)
+	hash := parser.DigestNormalized(normdOrigSQL).String()
 	bindRecords := h.ch[hash]
 	for _, bindRecord := range bindRecords {
-		if bindRecord.OriginalSQL == normdOrigSQL && bindRecord.Db == db {
+		if bindRecord.OriginalSQL == normdOrigSQL {
 			return bindRecord
 		}
 	}
